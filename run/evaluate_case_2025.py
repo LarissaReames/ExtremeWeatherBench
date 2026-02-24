@@ -73,6 +73,15 @@ LOCAL_MODELS = [
 #    "GFS-Ens-Mean",
 ]
 
+# Models with upper-air data (q, u, v at pressure levels) — needed for AR events
+LOCAL_MODELS_UPPER_AIR = [
+    "WeatherMesh-4",
+    "IFS",
+    "AIFS",
+    "GFS",
+    "GFS-Ens-Mean",
+]
+
 # NOAA S3 models (IFS-initialised AI models)
 NOAA_MODELS = {
 #    "FourCastNet-v2 (IFS)": "FOUR_v200_IFS",
@@ -99,6 +108,7 @@ VARIABLE_MAPPING = {
     "t2":   "surface_air_temperature",
     "t2m":  "surface_air_temperature",
     "gh":   "geopotential",      # local zarr uses gh (geopotential height in m)
+    "q":    "specific_humidity",
     # WeatherNext2 names
     "mean_sea_level_pressure": "air_pressure_at_mean_sea_level",
     "10m_u_component_of_wind": "surface_eastward_wind",
@@ -153,6 +163,8 @@ def _local_needed_vars_for_event(event_type: str) -> set[str]:
     """Source variable names needed from local zarr for this event type."""
     if event_type == "tropical_cyclone":
         return {"msl", "u10", "v10"}
+    if event_type == "atmospheric_river":
+        return {"u", "v", "q"}
     return {"t2", "t2m"}
 
 
@@ -1093,6 +1105,12 @@ def get_variables_for_event_type(event_type: str) -> list:
             "surface_eastward_wind",
             "surface_northward_wind",
         ]
+    elif event_type == "atmospheric_river":
+        return [
+            ewb.derived.AtmosphericRiverVariables(
+                output_variables=["atmospheric_river_land_intersection"]
+            )
+        ]
     elif event_type == "heat_wave":
         return ["surface_air_temperature"]
     else:
@@ -1133,6 +1151,19 @@ def get_metrics_for_event_type(event_type: str) -> list:
             ),
             ewb.metrics.TotalTrackError(
                 forecast_variable=mslp, target_variable=mslp,
+            ),
+        ]
+    elif event_type == "atmospheric_river":
+        ar_var = "atmospheric_river_land_intersection"
+        return [
+            ewb.metrics.CriticalSuccessIndex(
+                forecast_variable=ar_var, target_variable=ar_var,
+            ),
+            ewb.metrics.SpatialDisplacement(
+                forecast_variable=ar_var, target_variable=ar_var,
+            ),
+            ewb.metrics.EarlySignal(
+                forecast_variable=ar_var, target_variable=ar_var,
             ),
         ]
     elif event_type == "heat_wave":
@@ -1354,7 +1385,10 @@ def load_local_forecasts(
             ewb.derived.TropicalCycloneTrackVariables(min_track_timesteps=5)
         ]
 
-    for model_name in LOCAL_MODELS:
+    # AR events need models with upper-air data (q, u, v at pressure levels)
+    model_list = LOCAL_MODELS_UPPER_AIR if case.event_type == "atmospheric_river" else LOCAL_MODELS
+
+    for model_name in model_list:
         if only_model and model_name != only_model:
             continue
         print(f"   → {model_name} (local)")
@@ -1602,6 +1636,11 @@ def load_target(
     if case.event_type == "tropical_cyclone":
         print("   Using IBTrACS (observed TC tracks)")
         return ewb.inputs.IBTrACS()
+
+    if case.event_type == "atmospheric_river":
+        print("   Using ERA5 reanalysis (AR events require gridded upper-air data)")
+        variables = get_variables_for_event_type(case.event_type)
+        return ewb.inputs.ERA5(variables=variables)
 
     if target_type == "ghcn":
         variables = get_variables_for_event_type(case.event_type)
