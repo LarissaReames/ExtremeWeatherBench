@@ -1778,14 +1778,20 @@ def plot_station_error_maps(
     station_csv: Path,
     output_dir: Path,
     case_label: str = "",
+    hourly_maps: bool = False,
 ) -> None:
     """Create geographic station-error maps from a per-station results CSV.
 
-    For every ``(variable, lead_time_hours)`` group this produces:
+    Always generates event-timing maps (onset, duration, best-model).
+
+    When *hourly_maps* is True, also generates per-lead-hour maps:
     * One multi-panel figure (one subplot per model) showing RMSE at each station.
     * One multi-panel figure showing bias (mean error) at each station.
     * A "best model" map where each station is coloured by which model has
       the lowest RMSE.
+
+    Per-lead-hour maps are slow to generate, so they are off by default.
+    Pass ``--hourly-maps`` on the CLI to enable them.
     """
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
@@ -2049,6 +2055,10 @@ def plot_station_error_maps(
                     print(f"  ✓ Saved {fname}")
 
     # ── Per-lead-hour RMSE / bias / best-model maps ─────────────────────────
+    if not hourly_maps:
+        print("  ⏭️  Skipping per-lead-hour station maps (use --hourly-maps to enable)")
+        return
+
     for var in variables:
         for lh in lead_hours:
             sub = sdf[(sdf["variable"] == var) & (sdf["lead_time_hours"] == lh)]
@@ -2241,6 +2251,7 @@ def create_all_plots(
     case_label: str = "",
     by_valid_only: bool = False,
     by_landfall_relative_only: bool = False,
+    hourly_maps: bool = False,
 ):
     """Create all plots for the results."""
     print("\n📈 Creating plots...")
@@ -2421,13 +2432,14 @@ def create_all_plots(
         glob_pat = f"case_{case_id}_*_station_results.csv" if case_id else "*_station_results.csv"
         station_csvs = sorted(results_dir.glob(glob_pat))
         for station_csv in station_csvs:
-            plot_station_error_maps(station_csv, output_dir, case_label)
+            plot_station_error_maps(station_csv, output_dir, case_label, hourly_maps=hourly_maps)
 
 
 def main(
     csv_path: str,
     by_valid_only: bool = False,
     by_landfall_relative_only: bool = False,
+    hourly_maps: bool = False,
 ):
     """Main analysis function."""
     csv_path = Path(csv_path)
@@ -2471,6 +2483,7 @@ def main(
         case_label,
         by_valid_only=by_valid_only,
         by_landfall_relative_only=by_landfall_relative_only,
+        hourly_maps=hourly_maps,
     )
     
     print("\n✅ Analysis complete!")
@@ -2496,7 +2509,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Generate only landfall-relative 4-panel plots (MSLP, total/along/cross track).",
     )
-    
+    parser.add_argument(
+        "--hourly-maps",
+        action="store_true",
+        help=(
+            "Generate per-lead-hour station RMSE/bias/best-model maps. "
+            "Off by default because these are slow to generate."
+        ),
+    )
+
     args = parser.parse_args()
     
     try:
@@ -2504,6 +2525,7 @@ if __name__ == "__main__":
             args.csv_path,
             by_valid_only=args.by_valid_only,
             by_landfall_relative_only=args.by_landfall_relative_only,
+            hourly_maps=args.hourly_maps,
         )
     except Exception as e:
         print(f"\n❌ ANALYSIS FAILED!")
