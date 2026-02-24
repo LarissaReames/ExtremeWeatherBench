@@ -4090,3 +4090,15 @@
       longitude_min: 254.0
       longitude_max: 273.0
   event_type: freeze
+- case_id_number: 342
+  title: California Christmas Atmospheric River
+  start_date: 2025-12-20 00:00:00
+  end_date: 2025-12-27 00:00:00
+  location:
+    type: bounded_region
+    parameters:
+      latitude_min: 25.0
+      latitude_max: 50.0
+      longitude_min: 200.0
+      longitude_max: 250.0
+  event_type: atmospheric_river
