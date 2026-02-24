@@ -517,6 +517,15 @@ def load_results(csv_path: Path) -> pd.DataFrame:
         if n_valid > 0:
             print(f"  Derived valid_time for {n_valid} rows from init_time + lead_time")
     
+    # Convert metric_value to numeric. Boolean metrics (e.g. EarlySignal)
+    # store True/False strings — map those to 1.0/0.0 first.
+    bool_mask = df["metric_value"].astype(str).str.strip().isin(["True", "False"])
+    if bool_mask.any():
+        df.loc[bool_mask, "metric_value"] = (
+            df.loc[bool_mask, "metric_value"].astype(str).str.strip().map({"True": 1.0, "False": 0.0})
+        )
+    df["metric_value"] = pd.to_numeric(df["metric_value"], errors="coerce")
+
     # Convert pressure-based metrics from Pa to hPa
     pa_to_hpa_metrics = [
         "landfall_intensity_mae",
