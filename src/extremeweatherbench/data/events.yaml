@@ -4042,3 +4042,51 @@
       longitude_min: 243.9
       longitude_max: 265.35
   event_type: severe_convection
+- case_id_number: 338
+  title: Melissa
+  start_date: 2025-10-18 00:00:00
+  end_date: 2025-11-02 12:00:00
+  location:
+    type: bounded_region
+    parameters:
+      latitude_min: 5.5
+      latitude_max: 46.0
+      longitude_min: 276.0
+      longitude_max: 324.0
+  event_type: tropical_cyclone
+- case_id_number: 339
+  title: Erin
+  start_date: 2025-08-08 00:00:00
+  end_date: 2025-08-23 12:00:00
+  location:
+    type: bounded_region
+    parameters:
+      latitude_min: 5.0
+      latitude_max: 46.0
+      longitude_min: 286.0
+      longitude_max: 350.0
+  event_type: tropical_cyclone
+- case_id_number: 340
+  title: Late June 2025 Northeast US
+  start_date: 2025-06-20 00:00:00
+  end_date: 2025-06-28 12:00:00
+  location:
+    type: bounded_region
+    parameters:
+      latitude_min: 35.0
+      latitude_max: 47.5
+      longitude_min: 268.5
+      longitude_max: 293.1
+  event_type: heat_wave
+- case_id_number: 341
+  title: Late January Plains US Deep Freeze
+  start_date: 2026-01-21 12:00:00
+  end_date: 2026-01-31 12:00:00
+  location:
+    type: bounded_region
+    parameters:
+      latitude_min: 28.0
+      latitude_max: 52.0
+      longitude_min: 254.0
+      longitude_max: 273.0
+  event_type: freeze

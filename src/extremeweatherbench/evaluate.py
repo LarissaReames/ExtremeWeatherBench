@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import logging
 import pathlib
+import time
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import dask.array as da
@@ -32,6 +33,7 @@ OUTPUT_COLUMNS = [
     "value",
     "lead_time",
     "init_time",
+    "landfall",  # For multi-landfall tracking in TC metrics (0-indexed)
     "target_variable",
     "metric",
     "forecast_source",
@@ -305,13 +307,21 @@ def _run_parallel_evaluation(
 
     try:
         # TODO(198): return a generator and compute at a higher level
+        # Pass n_jobs to workers so they can limit dask threads appropriately
+        n_jobs = parallel_config.get("n_jobs")
+        kwargs["_n_jobs"] = len(case_operators) if n_jobs is None else n_jobs
+        
         with joblib.parallel_config(**parallel_config):
-            run_results = utils.ParallelTqdm(total_tasks=len(case_operators))(
+            run_results = utils.ParallelTqdm(
+                total_tasks=len(case_operators),
+                desc="Overall progress",
+                tqdm_position=0,
+            )(
                 # None is the cache_dir, we can't cache in parallel mode
                 joblib.delayed(compute_case_operator)(
-                    case_operator, cache_dir=cache_dir, **kwargs
+                    case_operator, cache_dir=cache_dir, worker_position=i, **kwargs
                 )
-                for case_operator in case_operators
+                for i, case_operator in enumerate(case_operators)
             )
         return run_results
     finally:
@@ -324,6 +334,7 @@ def _run_parallel_evaluation(
 def compute_case_operator(
     case_operator: "cases.CaseOperator",
     cache_dir: Optional[pathlib.Path] = None,
+    worker_position: Optional[int] = None,
     **kwargs,
 ) -> pd.DataFrame:
     """Compute the resulting evaluation of a case operator.
@@ -337,6 +348,7 @@ def compute_case_operator(
     Args:
         case_operator: The case operator to compute the results of.
         cache_dir: The directory to cache mid-flight outputs (serial mode).
+        worker_position: Position for tqdm progress bars in parallel execution.
 
     Returns:
         A pd.DataFrame of results from the case operator.
@@ -345,6 +357,47 @@ def compute_case_operator(
         TypeError: If any metric is not properly instantiated (i.e. isn't an
             instance or child class of BaseMetric).
     """
+    case_id = case_operator.case_metadata.case_id_number
+    forecast_name = case_operator.forecast.name
+    t_case = time.time()
+    print(
+        f"[EVAL] case={case_id} forecast={forecast_name} start",
+        flush=True,
+    )
+
+    # Force dask to use single-threaded scheduler when running in parallel
+    # to avoid conflicts with joblib's multiprocessing
+    import dask
+    import os
+    
+    # TEMPORARY: Disable synchronous scheduler to debug threaded freeze
+    force_synchronous = kwargs.get("force_synchronous_scheduler", False)
+    
+    if worker_position is not None and force_synchronous:
+        logger.info(f"Worker {worker_position}: Using synchronous dask scheduler")
+        dask.config.set(scheduler='synchronous')
+    else:
+        current_scheduler = dask.config.get('scheduler', default='threads')
+        
+        # If using threaded scheduler, limit threads per worker to avoid contention
+        if current_scheduler == 'threads':
+            # Get total number of jobs from kwargs if available
+            n_jobs = kwargs.get('_n_jobs', 1)
+            total_cores = os.cpu_count() or 4
+            
+            # Cap total thread usage at 60% of available cores (leave headroom for system)
+            max_total_threads = int(total_cores * 0.6)
+            
+            # Distribute threads among workers
+            # Give each worker at least 4 threads, but don't exceed max_total
+            threads_per_worker = max(4, min(16, max_total_threads // max(1, n_jobs)))
+            
+            dask.config.set(num_workers=threads_per_worker)
+            total_estimate = threads_per_worker * n_jobs
+            logger.info(f"Using dask scheduler: {current_scheduler} with {threads_per_worker} threads/worker "
+                       f"(n_jobs={n_jobs}, ~{total_estimate} total threads, {total_cores} cores available)")
+        else:
+            logger.info(f"Using dask scheduler: {current_scheduler} (worker_position={worker_position})")
     # Validate that all metrics are instantiated (not classes or callables)
     metric_list = list(case_operator.metric_list)
     for i, metric in enumerate(metric_list):
@@ -358,7 +411,20 @@ def compute_case_operator(
             raise TypeError(f"Metric must be a BaseMetric instance, got {type(metric)}")
     case_operator = dataclasses.replace(case_operator, metric_list=metric_list)
 
-    forecast_ds, target_ds = _build_datasets(case_operator, **kwargs)
+    t_build = time.time()
+    print(
+        f"[EVAL] case={case_id} forecast={forecast_name} building datasets...",
+        flush=True,
+    )
+    forecast_ds, target_ds = _build_datasets(
+        case_operator, worker_position=worker_position, **kwargs
+    )
+    print(
+        f"[EVAL] case={case_id} forecast={forecast_name} datasets built "
+        f"in {time.time()-t_build:.2f}s "
+        f"(forecast_dims={dict(forecast_ds.sizes)}, target_dims={dict(target_ds.sizes)})",
+        flush=True,
+    )
 
     # Check if any dimension has zero length
     if 0 in forecast_ds.sizes.values() or 0 in target_ds.sizes.values():
@@ -369,11 +435,18 @@ def compute_case_operator(
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     # spatiotemporally align the target and forecast datasets dependent on the target
+    t_align = time.time()
     aligned_forecast_ds, aligned_target_ds = (
         case_operator.target.maybe_align_forecast_to_target(forecast_ds, target_ds)
     )
+    print(
+        f"[EVAL] case={case_id} forecast={forecast_name} alignment done in "
+        f"{time.time()-t_align:.2f}s",
+        flush=True,
+    )
 
     # Compute and cache the datasets if cache_dir is set
+    t_cache_compute = time.time()
     aligned_forecast_ds = utils.maybe_cache_and_compute(
         aligned_forecast_ds,
         cache_dir=cache_dir,
@@ -384,10 +457,18 @@ def compute_case_operator(
         cache_dir=cache_dir,
         name=f"{case_operator.case_metadata.case_id_number}_{case_operator.target.name}",
     )
+    print(
+        f"[EVAL] case={case_id} forecast={forecast_name} cache/compute done in "
+        f"{time.time()-t_cache_compute:.2f}s",
+        flush=True,
+    )
     logger.info(
         "Datasets built for case %s.", case_operator.case_metadata.case_id_number
     )
     results = []
+
+    # Pass forecast source name through kwargs so metrics can use it
+    kwargs["forecast_source"] = case_operator.forecast.name
 
     # Collect all explicitly specified variables across all metrics
     # These variables are "claimed" and should not be used by metrics
@@ -464,25 +545,48 @@ def compute_case_operator(
             forecast_var_str = derived._maybe_convert_variable_to_string(forecast_var)
             target_var_str = derived._maybe_convert_variable_to_string(target_var)
 
+            t_prepare = time.time()
+            print(
+                f"[EVAL] case={case_id} forecast={forecast_name} "
+                f"metric-group={metric.name} var={forecast_var_str}->{target_var_str} "
+                "prepare kwargs start",
+                flush=True,
+            )
             metric_kwargs = metric.maybe_prepare_composite_kwargs(
                 forecast_data=aligned_forecast_ds[forecast_var_str],
                 target_data=aligned_target_ds[target_var_str],
                 **kwargs,
             )
+            print(
+                f"[EVAL] case={case_id} forecast={forecast_name} "
+                f"metric-group={metric.name} prepare kwargs done in {time.time()-t_prepare:.2f}s",
+                flush=True,
+            )
 
             # Evaluate each expanded metric
             for single_metric in metrics_to_evaluate:
-                results.append(
-                    _evaluate_metric_and_return_df(
-                        forecast_ds=aligned_forecast_ds,
-                        target_ds=aligned_target_ds,
-                        forecast_variable=forecast_var,
-                        target_variable=target_var,
-                        metric=single_metric,
-                        case_operator=case_operator,
-                        **metric_kwargs,
-                    )
+                t_metric = time.time()
+                print(
+                    f"[EVAL] case={case_id} forecast={forecast_name} "
+                    f"metric={single_metric.name} var={forecast_var_str}->{target_var_str} start",
+                    flush=True,
                 )
+                metric_df = _evaluate_metric_and_return_df(
+                    forecast_ds=aligned_forecast_ds,
+                    target_ds=aligned_target_ds,
+                    forecast_variable=forecast_var,
+                    target_variable=target_var,
+                    metric=single_metric,
+                    case_operator=case_operator,
+                    **metric_kwargs,
+                )
+                print(
+                    f"[EVAL] case={case_id} forecast={forecast_name} "
+                    f"metric={single_metric.name} done in {time.time()-t_metric:.2f}s "
+                    f"(rows={len(metric_df)})",
+                    flush=True,
+                )
+                results.append(metric_df)
 
         # Cache the results of each metric if caching
         if cache_dir:
@@ -496,7 +600,13 @@ def compute_case_operator(
                     / f"case_{case_operator.case_metadata.case_id_number}_results.pkl"
                 )
 
-    return _safe_concat(results, ignore_index=True)
+    out = _safe_concat(results, ignore_index=True)
+    print(
+        f"[EVAL] case={case_id} forecast={forecast_name} finished in "
+        f"{time.time()-t_case:.2f}s (total_rows={len(out)})",
+        flush=True,
+    )
+    return out
 
 
 def _extract_standard_metadata(
@@ -571,6 +681,9 @@ def _ensure_output_schema(df: pd.DataFrame, **metadata) -> pd.DataFrame:
     if init_time_missing != lead_time_missing:
         missing_cols.discard("init_time")
         missing_cols.discard("lead_time")
+
+    # landfall is only populated by TC landfall metrics and is optional otherwise.
+    missing_cols.discard("landfall")
 
     if missing_cols:
         logger.warning("Missing expected columns: %s.", missing_cols)
@@ -647,6 +760,19 @@ def _evaluate_metric_and_return_df(
     # Convert to DataFrame and add metadata, ensuring OUTPUT_COLUMNS compliance
 
     df = metric_result.to_dataframe(name="value").reset_index()
+
+    # Derive init_time when metrics preserve valid_time + lead_time but not init_time.
+    # This is common when forecast data is aligned to target on valid_time.
+    if (
+        "init_time" not in df.columns
+        and "valid_time" in df.columns
+        and "lead_time" in df.columns
+    ):
+        valid_dt = pd.to_datetime(df["valid_time"], errors="coerce")
+        lead_td = pd.to_timedelta(df["lead_time"], errors="coerce")
+        if valid_dt.notna().any() and lead_td.notna().any():
+            df["init_time"] = valid_dt - lead_td
+
     # TODO: add functionality for custom metadata columns
     metadata = _extract_standard_metadata(target_variable, metric, case_operator)
     return _ensure_output_schema(df, **metadata)
@@ -731,6 +857,7 @@ def _collect_metric_variables(
 
 def _build_datasets(
     case_operator: "cases.CaseOperator",
+    worker_position: Optional[int] = None,
     **kwargs,
 ) -> tuple[xr.Dataset, xr.Dataset]:
     """Build the target and forecast datasets for a case operator.
@@ -746,6 +873,7 @@ def _build_datasets(
 
     Args:
         case_operator: The case operator containing metadata and input sources.
+        worker_position: Position for tqdm progress bars in parallel execution.
         **kwargs: Additional keyword arguments to pass to pipeline steps.
     Returns:
         A tuple containing (forecast_dataset, target_dataset). If either dataset
@@ -790,10 +918,9 @@ def _build_datasets(
     )
 
     logger.info("Running target pipeline... ")
-    with TqdmCallback(
-        desc=f"Running target pipeline for case "
-        f"{case_operator.case_metadata.case_id_number}"
-    ):
+    forecast_name = case_operator.forecast.name
+    
+    with TqdmCallback(desc=f"[{forecast_name}] Target pipeline"):
         target_ds = run_pipeline(
             case_operator.case_metadata, augmented_target, **kwargs
         )
@@ -812,10 +939,8 @@ def _build_datasets(
         )
 
     logger.info("Running forecast pipeline... ")
-    with TqdmCallback(
-        desc=f"Running forecast pipeline for case "
-        f"{case_operator.case_metadata.case_id_number}"
-    ):
+    
+    with TqdmCallback(desc=f"[{forecast_name}] Forecast pipeline"):
         forecast_ds = run_pipeline(
             case_operator.case_metadata, augmented_forecast, **kwargs
         )
@@ -895,6 +1020,7 @@ def run_pipeline(
                     ds,
                     variables=input_data.variables,
                     case_metadata=case_metadata,
+                    forecast_source=input_data.name,
                     **kwargs,
                 )
             )

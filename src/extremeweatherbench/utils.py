@@ -68,24 +68,33 @@ def find_common_init_times(
     return common_init_times
 
 
-def is_valid_landfall(landfall: xr.DataArray | None) -> bool:
+def is_valid_landfall(landfall: xr.DataArray | None, require_init_time: bool = False) -> bool:
     """Check if a landfall DataArray is valid for processing.
 
-    A valid landfall has dimensions and contains the init_time coordinate
-    needed for landfall metric calculations. Also checks that the data
-    contains at least some non-NaN values.
+    A valid landfall contains location and time coordinates needed for
+    landfall metric calculations. Also checks that the data contains at
+    least some non-NaN values.
 
     Args:
         landfall: The landfall DataArray to check
+        require_init_time: If True, requires init_time coordinate (for forecasts).
+            If False, allows landfalls without init_time (for targets/observations).
 
     Returns:
         True if the landfall is valid, False otherwise
     """
-    if landfall is None or landfall.ndim == 0:
+    if landfall is None:
         return False
-    if "init_time" not in landfall.coords:
+    # Check for required location/time coordinates
+    required_coords = ["latitude", "longitude", "valid_time"]
+    if not all(coord in landfall.coords for coord in required_coords):
+        return False
+    if require_init_time and "init_time" not in landfall.coords:
         return False
     # Check that we have actual data (not all NaN)
+    # Handle scalar (0-dim) case
+    if landfall.ndim == 0:
+        return not np.isnan(landfall.values)
     if np.isnan(landfall.values).all():
         return False
     return True
@@ -200,10 +209,14 @@ def derive_indices_from_init_time_and_lead_time(
         array([0, 0, 1, 1, 2])
     """
     lead_time_grid, init_time_grid = np.meshgrid(dataset.lead_time, dataset.init_time)
-    valid_times = (
-        init_time_grid.flatten()
-        + pd.to_timedelta(lead_time_grid.flatten(), unit="h").to_numpy()
-    )
+    
+    # Handle both numeric hours and timedelta64 for lead_time
+    lead_time_flat = lead_time_grid.flatten()
+    if not np.issubdtype(dataset.lead_time.dtype, np.timedelta64):
+        # If lead_time is numeric (hours), convert to timedelta
+        lead_time_flat = pd.to_timedelta(lead_time_flat, unit="h").to_numpy()
+    
+    valid_times = init_time_grid.flatten() + lead_time_flat
     valid_times_reshaped = valid_times.reshape(
         (
             dataset.init_time.shape[0],
@@ -359,7 +372,7 @@ def convert_valid_time_to_init_time(da: xr.DataArray) -> xr.DataArray:
         da.valid_time, coords={"valid_time": da.valid_time}
     ) - xr.DataArray(da.lead_time, coords={"lead_time": da.lead_time})
     da = da.assign_coords(init_time=init_time)
-    return xr.concat(
+    out = xr.concat(
         [
             da.sel(lead_time=lead).swap_dims({"valid_time": "init_time"})
             for lead in da.lead_time
@@ -369,6 +382,14 @@ def convert_valid_time_to_init_time(da: xr.DataArray) -> xr.DataArray:
         compat="equals",
         join="outer",
     )
+    # Keep a complete valid_time coordinate in (lead_time, init_time) form.
+    # This preserves the truth timestamp associated with each init/lead pair.
+    if "init_time" in out.coords and "lead_time" in out.coords:
+        valid_time = xr.DataArray(
+            out.init_time, coords={"init_time": out.init_time}
+        ) + xr.DataArray(out.lead_time, coords={"lead_time": out.lead_time})
+        out = out.assign_coords(valid_time=valid_time)
+    return out
 
 
 def maybe_get_closest_timestamp_to_center_of_valid_times(
@@ -529,6 +550,7 @@ class ParallelTqdm(Parallel):
         desc: str | None = None,
         disable_progressbar: bool = False,
         show_joblib_header: bool = False,
+        tqdm_position: int | None = None,
         **kwargs,
     ):
         if "verbose" in kwargs:
@@ -540,6 +562,7 @@ class ParallelTqdm(Parallel):
         self.total_tasks = total_tasks
         self.desc = desc
         self.disable_progressbar = disable_progressbar
+        self.tqdm_position = tqdm_position
         self.progress_bar: tqdm.tqdm | None = None
 
     def __call__(self, iterable):
@@ -562,12 +585,16 @@ class ParallelTqdm(Parallel):
     def dispatch_one_batch(self, iterator):
         # start progress_bar, if not started yet.
         if self.progress_bar is None:
-            self.progress_bar = tqdm.tqdm(
-                desc=self.desc,
-                total=self.total_tasks,
-                disable=self.disable_progressbar,
-                unit="tasks",
-            )
+            tqdm_kwargs = {
+                "desc": self.desc,
+                "total": self.total_tasks,
+                "disable": self.disable_progressbar,
+                "unit": "tasks",
+            }
+            if self.tqdm_position is not None:
+                tqdm_kwargs["position"] = self.tqdm_position
+                tqdm_kwargs["leave"] = True
+            self.progress_bar = tqdm.tqdm(**tqdm_kwargs)
         # call parent function
         return super().dispatch_one_batch(iterator)
 
@@ -844,3 +871,4 @@ def maybe_cache_and_compute(
         return xr.open_dataset(cache_path / f"{name}.zarr")
     else:
         return xr.open_dataarray(cache_path / f"{name}.zarr")
+

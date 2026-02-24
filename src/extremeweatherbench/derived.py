@@ -2,6 +2,7 @@ import abc
 import logging
 from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 
+import numpy as np
 import xarray as xr
 
 import extremeweatherbench.events.atmospheric_river as ar
@@ -111,12 +112,13 @@ class TropicalCycloneTrackVariables(DerivedVariable):
     """
 
     # required variables for TC track identification
+    # geopotential_thickness is optional - if missing, warm-core filtering is skipped
     variables = [
         "air_pressure_at_mean_sea_level",
-        "geopotential_thickness",
         "surface_eastward_wind",
         "surface_northward_wind",
     ]
+    optional_variables = ["geopotential_thickness"]
     # Needs target data for track filtering
     requires_target_dataset = True
 
@@ -195,31 +197,36 @@ class TropicalCycloneTrackVariables(DerivedVariable):
         """Get cached track data or compute if not already cached.
 
         This method handles the caching logic to ensure track computation
-        is only done once per unique dataset.
+        is only done once per unique dataset. Tracks are cached to disk in zarr format
+        for fast reloading across runs.
 
         Track data is automatically obtained from `_target_dataset` in kwargs,
         which is provided by the evaluation pipeline when
         `requires_target_dataset=True`.
 
         Args:
-            data: Input dataset containing required variables.
+            data: Input dataset containing required meteorological variables
+            *args: Additional positional arguments
+            **kwargs: Additional keyword arguments, including:
+                - case_metadata: Case metadata for cache path generation
+                - forecast_name: Forecast model name for cache path
 
         Returns:
-            3D dataset containing tropical cyclone track information.
+            xr.Dataset containing the detected TC tracks
 
         Raises:
             ValueError: If _target_dataset is missing or lacks required vars.
         """
+        from pathlib import Path
+        import pandas as pd
 
-        # Prepare the data with wind variables as needed
-        prepared_data = calc.maybe_calculate_wind_speed(data)
-
-        # Generates the variables needed for the TC track calculation
-        # (geop. thickness, winds, temps, slp)
+        # Get metadata for cache path
+        case_metadata = kwargs.get("case_metadata", None)
+        forecast_name = kwargs.get("forecast_source", "unknown")
+        cache_path = None
 
         # Get track data from target dataset (auto-provided by pipeline)
         tc_track_data = kwargs.get("_target_dataset", None)
-
         if tc_track_data is not None:
             # Verify it has the required variables for TC tracking
             required = ["latitude", "longitude", "valid_time"]
@@ -228,7 +235,6 @@ class TropicalCycloneTrackVariables(DerivedVariable):
                 for var in required
             )
             if not has_required:
-                case_metadata = kwargs.get("case_metadata", None)
                 case_id = case_metadata.case_id_number if case_metadata else "unknown"
                 raise ValueError(
                     f"Target dataset for case {case_id} missing required "
@@ -238,7 +244,6 @@ class TropicalCycloneTrackVariables(DerivedVariable):
                 )
             logger.debug("Using target dataset as track data for TC detection")
         else:
-            case_metadata = kwargs.get("case_metadata", None)
             case_id = case_metadata.case_id_number if case_metadata else "unknown"
             raise ValueError(
                 f"No track data provided for case {case_id}. "
@@ -246,25 +251,111 @@ class TropicalCycloneTrackVariables(DerivedVariable):
                 "is available in the evaluation pipeline."
             )
 
-        tctracks_ds = tropical_cyclone.generate_tc_tracks_by_init_time(
-            sea_level_pressure=prepared_data["air_pressure_at_mean_sea_level"],
-            wind_speed=prepared_data["surface_wind_speed"],
-            tc_track_analysis_data=tc_track_data,
-            geopotential_thickness=prepared_data.get("geopotential_thickness", None),
-            slp_contour_magnitude=self.slp_contour_magnitude,
-            dz_contour_magnitude=self.dz_contour_magnitude,
-            min_distance_between_peaks=self.min_distance_between_peaks,
-            max_spatial_distance_degrees=self.max_spatial_distance_degrees,
-            max_temporal_hours=self.max_temporal_hours,
-            use_contour_validation=self.use_contour_validation,
-            min_track_timesteps=self.min_track_timesteps,
-            latitude_max_degrees=self.latitude_max_degrees,
-            surface_pressure_threshold=self.surface_pressure_threshold,
-            orography=self.orography,
-            max_gc_distance_slp_contour_degrees=self.max_gc_distance_slp_contour_degrees,
-            max_gc_distance_dz_contour_degrees=self.max_gc_distance_dz_contour_degrees,
-            orography_filter_threshold=self.orography_filter_threshold,
-        )
+        # Track requested init times from the current forecast dataset.
+        requested_init_times = None
+        if "init_time" in data.coords:
+            raw_init = np.asarray(data.init_time.values).reshape(-1)
+            parsed_init = pd.to_datetime(raw_init, errors="coerce")
+            valid_init = parsed_init[~pd.isna(parsed_init)]
+            requested_init_times = pd.DatetimeIndex(valid_init).unique().sort_values()
+
+        def _compute_tracks(input_data: xr.Dataset) -> xr.Dataset:
+            """Run TC tracking for the provided dataset slice."""
+            prepared_data = calc.maybe_calculate_wind_speed(input_data)
+            return tropical_cyclone.generate_tc_tracks_by_init_time(
+                sea_level_pressure=prepared_data["air_pressure_at_mean_sea_level"],
+                wind_speed=prepared_data["surface_wind_speed"],
+                tc_track_analysis_data=tc_track_data,
+                geopotential_thickness=prepared_data.get("geopotential_thickness", None),
+                slp_contour_magnitude=self.slp_contour_magnitude,
+                dz_contour_magnitude=self.dz_contour_magnitude,
+                min_distance_between_peaks=self.min_distance_between_peaks,
+                max_spatial_distance_degrees=self.max_spatial_distance_degrees,
+                max_temporal_hours=self.max_temporal_hours,
+                use_contour_validation=self.use_contour_validation,
+                min_track_timesteps=self.min_track_timesteps,
+                latitude_max_degrees=self.latitude_max_degrees,
+                surface_pressure_threshold=self.surface_pressure_threshold,
+                orography=self.orography,
+                max_gc_distance_slp_contour_degrees=self.max_gc_distance_slp_contour_degrees,
+                max_gc_distance_dz_contour_degrees=self.max_gc_distance_dz_contour_degrees,
+                orography_filter_threshold=self.orography_filter_threshold,
+            )
+
+        if case_metadata is not None:
+            case_id = case_metadata.case_id_number
+            # Create cache directory
+            cache_dir = Path("/huge/proc/larissa/tc_tracks_cache")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Create a cache key based on forecast name, case, and tracking parameters
+            cache_key = f"{forecast_name}_case{case_id}_mintrack{self.min_track_timesteps}"
+            cache_path = cache_dir / f"{cache_key}.zarr"
+            
+            # Check if cached tracks exist
+            if cache_path.exists():
+                print(f"📦 Loading cached TC tracks from {cache_path}")
+                try:
+                    cached_tracks = xr.open_zarr(cache_path)
+                    if "init_time" in cached_tracks.coords and requested_init_times is not None:
+                        raw_cached = np.asarray(cached_tracks.init_time.values).reshape(-1)
+                        parsed_cached = pd.to_datetime(raw_cached, errors="coerce")
+                        valid_cached = parsed_cached[~pd.isna(parsed_cached)]
+                        cached_init_times = pd.DatetimeIndex(valid_cached).unique().sort_values()
+                        missing_init_times = requested_init_times.difference(cached_init_times)
+
+                        if len(missing_init_times) == 0:
+                            print("✓ Loaded cached TC tracks; cache covers all requested init_times")
+                            try:
+                                return cached_tracks.sel(
+                                    init_time=missing_init_times.union(requested_init_times).values
+                                )
+                            except Exception:
+                                return cached_tracks
+
+                        print(f"↻ Extending TC track cache: {len(missing_init_times)} missing init_times")
+                        missing_subset = data.sel(init_time=missing_init_times.values)
+                        missing_tracks = _compute_tracks(missing_subset)
+                        merged_tracks = xr.concat(
+                            [cached_tracks, missing_tracks],
+                            dim="init_time",
+                            coords="minimal",
+                            compat="override",
+                        ).sortby("init_time")
+                        merged_tracks = merged_tracks.groupby("init_time").first()
+
+                        print(f"💾 Updating TC tracks cache: {cache_path}")
+                        merged_tracks.to_zarr(cache_path, mode="w")
+                        return merged_tracks.sel(init_time=requested_init_times.values)
+
+                    # Fallback path when init_time is absent.
+                    if "latitude" in cached_tracks.coords:
+                        n_detections = int((~np.isnan(cached_tracks.coords["latitude"])).sum())
+                        print(f"✓ Loaded {n_detections} cached TC detections")
+                    else:
+                        print("✓ Loaded cached TC tracks (empty dataset)")
+                    return cached_tracks
+                except Exception as e:
+                    print(f"⚠ Failed to load cached tracks: {e}. Recomputing...")
+                    # If loading fails, delete the corrupted cache and recompute
+                    import shutil
+                    shutil.rmtree(cache_path, ignore_errors=True)
+        tctracks_ds = _compute_tracks(data)
+        
+        # Save tracks to cache if we have metadata
+        if case_metadata is not None and cache_path is not None:
+            try:
+                print(f"💾 Saving TC tracks to cache: {cache_path}")
+                tctracks_ds.to_zarr(cache_path, mode="w")
+                # Count non-NaN detections
+                if "latitude" in tctracks_ds.coords:
+                    n_detections = int((~np.isnan(tctracks_ds.coords["latitude"])).sum())
+                    print(f"✓ Cached {n_detections} TC detections")
+                else:
+                    print("✓ Cached TC tracks (empty dataset)")
+            except Exception as e:
+                print(f"⚠ Failed to cache tracks: {e}")
+        
         return tctracks_ds
 
     def derive_variable(self, data: xr.Dataset, *args, **kwargs) -> xr.DataArray:
@@ -501,6 +592,15 @@ def maybe_derive_variables(
     elif isinstance(output, xr.Dataset):
         # Check if derived dataset dimensions are compatible for merging
         output_ds = output
+        
+        # If the derived variable output is empty (e.g., no TC tracks found),
+        # return the original gridded data instead of replacing it with empty tracks
+        if output_ds.sizes.get('valid_time', 0) == 0 and output_ds.sizes.get('time', 0) == 0:
+            logger.warning(
+                f"Derived variable {derived_variable.name} returned empty dataset "
+                "(no tracks found). Keeping original gridded data."
+            )
+            return data
 
     else:
         # If output is neither DataArray nor Dataset, return original
@@ -577,3 +677,4 @@ def _maybe_convert_variable_to_string(
         return variable
     # variable is a DerivedVariable instance with .name set in __init__
     return str(variable.name)
+
