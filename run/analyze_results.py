@@ -705,18 +705,20 @@ def plot_metric_by_leadtime(
         .mean()
         .reset_index()
     )
+    # Convert hours to days for x-axis
+    grouped["lead_time_days"] = grouped["lead_time_hours"] / 24.0
 
     # Create plot
     fig, ax = plt.subplots(figsize=(12, 8))
-    
+
     # Plot each forecast with its designated style
     for forecast in order_forecasts(grouped["forecast_name"].unique()):
         forecast_data = grouped[grouped["forecast_name"] == forecast]
         style = get_model_style(forecast)
         draw = get_model_plot_params(forecast, base_markersize=8)
-        
+
         ax.plot(
-            forecast_data["lead_time_hours"],
+            forecast_data["lead_time_days"],
             forecast_data["metric_value"],
             label=forecast,
             marker=style["marker"],
@@ -729,12 +731,12 @@ def plot_metric_by_leadtime(
             alpha=draw["alpha"],
             zorder=draw["zorder"],
         )
-    
+
     # Get display labels
     y_label = get_display_label(variable, metric_name, include_units=True)
     title_label = get_display_label(variable, metric_name, include_units=False)
-    
-    ax.set_xlabel("Lead Time (hours)", fontsize=13, fontweight="bold")
+
+    ax.set_xlabel("Lead Time (days)", fontsize=13, fontweight="bold")
     ax.set_ylabel(y_label, fontsize=13, fontweight="bold")
     ax.set_title(f"{title_label} vs Lead Time", fontsize=15, fontweight="bold")
     ax.legend(frameon=True, shadow=True, fontsize=10)
@@ -752,24 +754,23 @@ def plot_metric_by_leadtime(
     
     print(f"  ✓ Saved {output_file.name}")
     
-    # Create zoomed version (0-96 hours)
+    # Create zoomed version (0-4 days / 0-96 hours)
     fig, ax = plt.subplots(figsize=(12, 8))
-    
-    # Plot each forecast, filtered to 0-96 hours
+
+    # Plot each forecast, filtered to 0-4 days
     for forecast in order_forecasts(grouped["forecast_name"].unique()):
         forecast_data = grouped[grouped["forecast_name"] == forecast]
-        # Filter to 0-96 hours
         forecast_data = forecast_data[
-            (forecast_data["lead_time_hours"] >= 0) & 
-            (forecast_data["lead_time_hours"] <= 96)
+            (forecast_data["lead_time_days"] >= 0) &
+            (forecast_data["lead_time_days"] <= 4)
         ]
-        
+
         if len(forecast_data) > 0:
             style = get_model_style(forecast)
             draw = get_model_plot_params(forecast, base_markersize=8)
-            
+
             ax.plot(
-                forecast_data["lead_time_hours"],
+                forecast_data["lead_time_days"],
                 forecast_data["metric_value"],
                 label=forecast,
                 marker=style["marker"],
@@ -782,15 +783,15 @@ def plot_metric_by_leadtime(
                 alpha=draw["alpha"],
                 zorder=draw["zorder"],
             )
-    
-    ax.set_xlabel("Lead Time (hours)", fontsize=13, fontweight="bold")
+
+    ax.set_xlabel("Lead Time (days)", fontsize=13, fontweight="bold")
     ax.set_ylabel(y_label, fontsize=13, fontweight="bold")
-    ax.set_title(f"{title_label} vs Lead Time (0-96h)", fontsize=15, fontweight="bold")
+    ax.set_title(f"{title_label} vs Lead Time (0-4 days)", fontsize=15, fontweight="bold")
     ax.legend(frameon=True, shadow=True, fontsize=10)
     ax.grid(True, alpha=0.3)
     if metric_name in SIGNED_METRICS:
         ax.axhline(0.0, color="black", linewidth=2, alpha=0.8, zorder=1)
-    ax.set_xlim(0, 96)
+    ax.set_xlim(0, 4)
     
     # Save zoomed version
     output_file_zoomed = output_dir / f"{prefix}{filename_label}_by_leadtime_0-96h.png"
