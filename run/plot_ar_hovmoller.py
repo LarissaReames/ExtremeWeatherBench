@@ -279,6 +279,33 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
         else:
             ax.tick_params(labelbottom=False)
 
+    # Add city labels on the right y-axis of rightmost column panels
+    CITIES = {
+        32.7: "San Diego",
+        34.0: "Los Angeles",
+        37.8: "San Francisco",
+        45.5: "Portland",
+        47.6: "Seattle",
+    }
+    for row_idx in range(nrows):
+        rightmost_col = ncols - 1
+        # Find the rightmost visible panel in this row
+        while rightmost_col >= 0:
+            panel_num = row_idx * ncols + rightmost_col
+            if panel_num < n_panels:
+                break
+            rightmost_col -= 1
+        if rightmost_col < 0:
+            continue
+        ax = axes[row_idx][rightmost_col]
+        ax2 = ax.twinx()
+        city_lats = sorted(CITIES.keys())
+        city_names = [CITIES[lat] for lat in city_lats]
+        ax2.set_ylim(ax.get_ylim())
+        ax2.set_yticks(city_lats)
+        ax2.set_yticklabels(city_names, fontsize=7, color="gray")
+        ax2.tick_params(axis="y", length=3, width=0.5, colors="gray")
+
     # Hide unused subplots
     for idx in range(n_panels, nrows * ncols):
         row, col = divmod(idx, ncols)
