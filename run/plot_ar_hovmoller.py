@@ -317,7 +317,7 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
     # ERA5 IVT colorbar — vertical, tight to left of ERA5 panel
     # Labels and title on the LEFT side of the colorbar
     era5_pos = axes[0][0].get_position()
-    cbar_ax_ivt = fig.add_axes([era5_pos.x0 - 0.04, era5_pos.y0, 0.012, era5_pos.height])
+    cbar_ax_ivt = fig.add_axes([era5_pos.x0 - 0.06, era5_pos.y0, 0.012, era5_pos.height])
     cb_ivt = plt.colorbar(cf_era5, cax=cbar_ax_ivt, orientation="vertical")
     cb_ivt.ax.yaxis.set_ticks_position("left")
     cb_ivt.ax.yaxis.set_label_position("left")
