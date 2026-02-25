@@ -734,6 +734,82 @@ class Accuracy(ThresholdMetric):
         return transformed.accuracy()
 
 
+class FrequencyBias(ThresholdMetric):
+    """Compute Frequency Bias from binary classifications.
+
+    Extends ThresholdMetric to compute the frequency bias (also called bias
+    score) between forecast and target. Frequency bias = (hits + false_alarms)
+    / (hits + misses), or equivalently the ratio of forecast yes events to
+    observed yes events. A value of 1.0 indicates no bias; >1 means
+    over-prediction; <1 means under-prediction.
+    """
+
+    def __init__(self, name: str = "FrequencyBias", *args, **kwargs):
+        """Initialize the Frequency Bias metric.
+
+        Args:
+            name: The name of the metric. Defaults to "FrequencyBias".
+            *args: Additional positional arguments passed to ThresholdMetric.
+            **kwargs: Additional keyword arguments passed to ThresholdMetric.
+        """
+        super().__init__(name, *args, **kwargs)
+
+    def _compute_metric(
+        self,
+        forecast: xr.DataArray,
+        target: xr.DataArray,
+        **kwargs: Any,
+    ) -> Any:
+        # Use pre-computed manager if provided, else compute
+        transformed = kwargs.get("transformed_manager")
+        if transformed is None:
+            transformed = self.transformed_contingency_manager(
+                forecast=forecast,
+                target=target,
+                forecast_threshold=self.forecast_threshold,
+                target_threshold=self.target_threshold,
+                preserve_dims=self.preserve_dims,
+            )
+        return transformed.frequency_bias()
+
+
+class EquitableThreatScore(ThresholdMetric):
+    """Compute Equitable Threat Score (ETS / Gilbert Skill Score).
+
+    Extends ThresholdMetric to compute ETS, which accounts for hits due to
+    random chance. ETS = (hits - hits_random) / (hits + misses + false_alarms
+    - hits_random). Range: -1/3 to 1, where 0 = no skill, 1 = perfect.
+    """
+
+    def __init__(self, name: str = "EquitableThreatScore", *args, **kwargs):
+        """Initialize the Equitable Threat Score metric.
+
+        Args:
+            name: The name of the metric. Defaults to "EquitableThreatScore".
+            *args: Additional positional arguments passed to ThresholdMetric.
+            **kwargs: Additional keyword arguments passed to ThresholdMetric.
+        """
+        super().__init__(name, *args, **kwargs)
+
+    def _compute_metric(
+        self,
+        forecast: xr.DataArray,
+        target: xr.DataArray,
+        **kwargs: Any,
+    ) -> Any:
+        # Use pre-computed manager if provided, else compute
+        transformed = kwargs.get("transformed_manager")
+        if transformed is None:
+            transformed = self.transformed_contingency_manager(
+                forecast=forecast,
+                target=target,
+                forecast_threshold=self.forecast_threshold,
+                target_threshold=self.target_threshold,
+                preserve_dims=self.preserve_dims,
+            )
+        return transformed.equitable_threat_score()
+
+
 class MeanSquaredError(BaseMetric):
     """Compute Mean Squared Error between forecast and target.
 

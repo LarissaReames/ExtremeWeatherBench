@@ -1037,11 +1037,10 @@ def _maybe_cache_derived(
                 )
 
         ds_out.to_netcdf(str(out_file), mode="w", engine="h5netcdf")
-        logger.info(
-            "Cached derived variables → %s (%d vars: %s)",
-            out_file,
-            len(ds_out.data_vars),
-            list(ds_out.data_vars),
+        print(
+            f"[CACHE] Saved derived variables → {out_file} "
+            f"({len(ds_out.data_vars)} vars: {list(ds_out.data_vars)})",
+            flush=True,
         )
     except Exception as exc:
         logger.warning("Failed to cache derived variables: %s", exc)

@@ -2162,6 +2162,438 @@ def _compute_station_results(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Heavy Precipitation Evaluation (MRMS-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Precipitation thresholds for categorical metrics (in meters, matching zarr units)
+PRECIP_THRESHOLDS_M = [0.001, 0.0025, 0.005, 0.01, 0.025]  # 1, 2.5, 5, 10, 25 mm
+PRECIP_THRESHOLD_LABELS = ["1mm", "2.5mm", "5mm", "10mm", "25mm"]
+
+
+def _regrid_mrms_to_025(mrms_da: xr.DataArray, qi_da: xr.DataArray,
+                         qi_threshold: float = 0.0) -> xr.DataArray:
+    """Regrid MRMS data from ~0.01° to 0.25° using area-mean, with QI masking.
+
+    Parameters
+    ----------
+    mrms_da : xr.DataArray
+        MRMS tp_6hr on native ~0.01° grid (dims: lat, lon).
+    qi_da : xr.DataArray
+        MRMS quality index on same grid.
+    qi_threshold : float
+        Minimum QI to include a pixel (default 0.0 = has radar data).
+
+    Returns
+    -------
+    xr.DataArray on 0.25° grid with dims (latitude, longitude).
+    """
+    # Mask by quality index
+    mrms_masked = mrms_da.where(qi_da >= qi_threshold)
+
+    # Create 0.25° target grid matching model coordinates
+    target_lats = np.arange(20.125, 55.0, 0.25)  # MRMS CONUS coverage
+    target_lons = np.arange(230.125, 300.0, 0.25)
+
+    # Bin averaging: assign each MRMS pixel to a 0.25° bin
+    mrms_lats = mrms_masked.lat.values
+    mrms_lons = mrms_masked.lon.values
+
+    lat_bins = np.floor((mrms_lats - 20.0) / 0.25).astype(int)
+    lon_bins = np.floor((mrms_lons - 230.0) / 0.25).astype(int)
+
+    nlat = len(target_lats)
+    nlon = len(target_lons)
+
+    # Use groupby-like approach: reshape into bins and take mean
+    data = mrms_masked.values
+    if data.ndim == 3:
+        data = data.squeeze()
+    assert data.ndim == 2, f"Expected 2D MRMS data, got {data.ndim}D"
+
+    result = np.full((nlat, nlon), np.nan, dtype=np.float32)
+    count = np.zeros((nlat, nlon), dtype=np.int32)
+
+    # Vectorized binning using np.add.at
+    valid = np.isfinite(data)
+    lat_idx = np.clip(lat_bins, 0, nlat - 1)
+    lon_idx = np.clip(lon_bins, 0, nlon - 1)
+
+    # Create 2D index arrays
+    lat_grid, lon_grid = np.meshgrid(lat_idx, lon_idx, indexing='ij')
+
+    # Sum valid values into bins
+    sum_arr = np.zeros((nlat, nlon), dtype=np.float64)
+    np.add.at(sum_arr, (lat_grid[valid], lon_grid[valid]), data[valid])
+    np.add.at(count, (lat_grid[valid], lon_grid[valid]), 1)
+
+    # Mean
+    mask = count > 0
+    result[mask] = (sum_arr[mask] / count[mask]).astype(np.float32)
+
+    return xr.DataArray(
+        result,
+        coords={"latitude": target_lats, "longitude": target_lons},
+        dims=("latitude", "longitude"),
+    )
+
+
+def load_mrms_for_event(
+    case: "ewb.IndividualCase",
+) -> dict[str, xr.DataArray]:
+    """Load and regrid MRMS tp_6hr for all valid times in the event period.
+
+    Returns
+    -------
+    dict mapping valid_time_str -> regridded xr.DataArray on 0.25° grid
+    """
+    from datetime import timedelta as td
+
+    start = case.start_date
+    end = case.end_date
+    mrms_data = {}
+
+    current = start
+    while current <= end:
+        init_str = current.strftime("%Y%m%d%H")
+        zarr_path = LOCAL_ZARR_ROOT / init_str / "MRMS" / f"MRMS_{init_str}.zarr"
+
+        if zarr_path.exists():
+            try:
+                ds = xr.open_zarr(str(zarr_path), chunks=None)
+                tp = ds["tp_6hr"].squeeze()
+                qi = ds["RadarAccumulationQualityIndex_6hr"].squeeze()
+                regridded = _regrid_mrms_to_025(tp, qi, qi_threshold=0.0)
+                vt_str = current.strftime("%Y%m%d%H")
+                mrms_data[vt_str] = regridded
+            except Exception as e:
+                logger.warning(f"Failed to load MRMS {init_str}: {e}")
+        current += td(hours=6)
+
+    return mrms_data
+
+
+def _load_model_precip_for_event(
+    case: "ewb.IndividualCase",
+    model_name: str,
+) -> xr.Dataset | None:
+    """Load model tp_6hr for all inits relevant to the event.
+
+    Returns xr.Dataset with dims (init_time, step, latitude, longitude).
+    """
+    from datetime import timedelta as td
+
+    start = case.start_date
+    end = case.end_date
+    lookback = td(hours=MAX_LEAD_HOURS)
+
+    datasets = []
+    current = start - lookback
+    while current <= end:
+        for hour in [0, 6, 12, 18]:
+            init_dt = current.replace(hour=hour, minute=0, second=0, microsecond=0)
+            init_str = init_dt.strftime("%Y%m%d%H")
+            zarr_path = (
+                LOCAL_ZARR_ROOT / init_str / model_name
+                / f"{model_name}_{init_str}.zarr"
+            )
+            if not zarr_path.exists():
+                continue
+            try:
+                ds = xr.open_zarr(str(zarr_path), chunks=None)
+                if "tp_6hr" not in ds:
+                    continue
+                tp = ds["tp_6hr"]
+                # Keep only steps that produce valid times within the event
+                if "step" in tp.dims:
+                    steps_h = tp.step.values
+                    valid_times = np.array([
+                        np.datetime64(init_dt) + np.timedelta64(int(s), 'h')
+                        for s in steps_h
+                    ])
+                    event_start = np.datetime64(start)
+                    event_end = np.datetime64(end)
+                    mask = (valid_times >= event_start) & (valid_times <= event_end)
+                    if not mask.any():
+                        continue
+                    tp = tp.isel(step=mask)
+
+                    # Add init_time coordinate
+                    tp = tp.assign_coords(init_time=np.datetime64(init_dt))
+                    tp = tp.expand_dims("init_time")
+                    datasets.append(tp)
+            except Exception as e:
+                logger.warning(f"Failed to load {model_name} {init_str}: {e}")
+
+        current += td(days=1)
+
+    if not datasets:
+        return None
+    return xr.concat(datasets, dim="init_time")
+
+
+def run_heavy_precip_evaluation(
+    case: "ewb.IndividualCase",
+    model_names: list[str],
+    output_file: Path,
+) -> pd.DataFrame:
+    """Run precipitation evaluation against MRMS for all models.
+
+    Computes RMSE, Bias, FrequencyBias, and ETS at multiple thresholds,
+    broken down by lead time.
+
+    Returns DataFrame in EWB-compatible format.
+    """
+    print(f"\n🌧️  Heavy Precip Evaluation (MRMS verification)")
+
+    # Load MRMS
+    print("   Loading MRMS data...")
+    mrms_data = load_mrms_for_event(case)
+    n_mrms = len(mrms_data)
+    print(f"   Loaded {n_mrms} MRMS valid times")
+
+    if n_mrms == 0:
+        print("   ⚠️  No MRMS data available — skipping heavy precip evaluation")
+        return pd.DataFrame()
+
+    # Subset MRMS to the case bounding box
+    if hasattr(case, 'location') and hasattr(case.location, 'parameters'):
+        lat_min = case.location.parameters.get('latitude_min', 20)
+        lat_max = case.location.parameters.get('latitude_max', 55)
+        lon_min = case.location.parameters.get('longitude_min', 230)
+        lon_max = case.location.parameters.get('longitude_max', 300)
+    else:
+        lat_min, lat_max = 20, 55
+        lon_min, lon_max = 230, 300
+
+    # Clip to MRMS coverage
+    lat_min = max(lat_min, 20.0)
+    lat_max = min(lat_max, 55.0)
+    lon_min = max(lon_min, 230.0)
+    lon_max = min(lon_max, 300.0)
+
+    all_rows = []
+
+    for model_name in model_names:
+        print(f"\n   Processing {model_name}...")
+        try:
+            model_ds = _load_model_precip_for_event(case, model_name)
+        except Exception as e:
+            print(f"   ⚠️  Failed to load {model_name}: {e}")
+            continue
+
+        if model_ds is None:
+            print(f"   ⚠️  No tp_6hr data for {model_name}")
+            continue
+
+        # For each init time and step, find matching MRMS valid time
+        init_times = model_ds.init_time.values
+        n_matched = 0
+
+        # Group by lead time for aggregation
+        lead_metrics: dict[float, list[dict]] = {}
+
+        for init_time in init_times:
+            fc = model_ds.sel(init_time=init_time)
+            init_dt = pd.Timestamp(init_time)
+
+            for step_val in fc.step.values:
+                step_h = float(step_val)
+                if step_h == 0:
+                    continue  # Skip analysis time
+
+                valid_dt = init_dt + pd.Timedelta(hours=step_h)
+                vt_str = valid_dt.strftime("%Y%m%d%H")
+
+                if vt_str not in mrms_data:
+                    continue
+
+                # Get model forecast
+                fc_step = fc.sel(step=step_val)
+
+                # Get MRMS for this valid time and subset to overlap region
+                mrms_vt = mrms_data[vt_str]
+                mrms_lats = mrms_vt.latitude.values
+                mrms_lons = mrms_vt.longitude.values
+
+                # Subset MRMS to case bounding box
+                mrms_sub = mrms_vt.sel(
+                    latitude=slice(lat_min, lat_max),
+                    longitude=slice(lon_min, lon_max),
+                )
+                if mrms_sub.size == 0:
+                    continue
+
+                # Select model data at MRMS grid points using nearest-neighbor
+                # Model coords may be "lat"/"lon" — handle both conventions
+                lat_dim = "lat" if "lat" in fc_step.dims else "latitude"
+                lon_dim = "lon" if "lon" in fc_step.dims else "longitude"
+
+                try:
+                    fc_sub = fc_step.sel(
+                        **{lat_dim: mrms_sub.latitude, lon_dim: mrms_sub.longitude},
+                        method="nearest",
+                    )
+                except Exception:
+                    continue
+
+                fc_vals = fc_sub.values.squeeze()
+                mrms_vals = mrms_sub.values
+
+                # Mask: only where both have valid data
+                valid = np.isfinite(fc_vals) & np.isfinite(mrms_vals)
+                if valid.sum() < 10:
+                    continue
+
+                fc_v = fc_vals[valid]
+                mrms_v = mrms_vals[valid]
+                n_matched += 1
+
+                if step_h not in lead_metrics:
+                    lead_metrics[step_h] = []
+                lead_metrics[step_h].append({
+                    "fc": fc_v,
+                    "mrms": mrms_v,
+                })
+
+        print(f"   {model_name}: {n_matched} matched forecast-MRMS pairs")
+
+        # Compute metrics per lead time
+        for step_h in sorted(lead_metrics.keys()):
+            pairs = lead_metrics[step_h]
+
+            # Concatenate all matched pairs for this lead time
+            all_fc = np.concatenate([p["fc"] for p in pairs])
+            all_mrms = np.concatenate([p["mrms"] for p in pairs])
+
+            lead_td = pd.Timedelta(hours=step_h)
+
+            # Continuous metrics
+            diff = all_fc - all_mrms
+            rmse = float(np.sqrt(np.mean(diff**2)))
+            mae = float(np.mean(np.abs(diff)))
+            bias = float(np.mean(diff))
+
+            # Convert to mm for output
+            rmse_mm = rmse * 1000
+            mae_mm = mae * 1000
+            bias_mm = bias * 1000
+
+            all_rows.append({
+                "value": rmse_mm,
+                "lead_time": str(lead_td),
+                "init_time": "",
+                "landfall": "",
+                "target_variable": "tp_6hr",
+                "metric": "RootMeanSquaredError",
+                "forecast_source": model_name,
+                "target_source": "MRMS",
+                "case_id_number": case.case_id_number,
+                "event_type": "heavy_precip",
+            })
+            all_rows.append({
+                "value": mae_mm,
+                "lead_time": str(lead_td),
+                "init_time": "",
+                "landfall": "",
+                "target_variable": "tp_6hr",
+                "metric": "MeanAbsoluteError",
+                "forecast_source": model_name,
+                "target_source": "MRMS",
+                "case_id_number": case.case_id_number,
+                "event_type": "heavy_precip",
+            })
+            all_rows.append({
+                "value": bias_mm,
+                "lead_time": str(lead_td),
+                "init_time": "",
+                "landfall": "",
+                "target_variable": "tp_6hr",
+                "metric": "MeanError",
+                "forecast_source": model_name,
+                "target_source": "MRMS",
+                "case_id_number": case.case_id_number,
+                "event_type": "heavy_precip",
+            })
+
+            # Categorical metrics at each threshold
+            for thresh_m, thresh_label in zip(PRECIP_THRESHOLDS_M, PRECIP_THRESHOLD_LABELS):
+                fc_binary = (all_fc >= thresh_m).astype(float)
+                mrms_binary = (all_mrms >= thresh_m).astype(float)
+
+                hits = float(np.sum((fc_binary == 1) & (mrms_binary == 1)))
+                false_alarms = float(np.sum((fc_binary == 1) & (mrms_binary == 0)))
+                misses = float(np.sum((fc_binary == 0) & (mrms_binary == 1)))
+
+                # Frequency Bias
+                fbias = (hits + false_alarms) / max(hits + misses, 1)
+
+                # ETS
+                hits_random = (hits + misses) * (hits + false_alarms) / max(len(all_fc), 1)
+                denom = hits + misses + false_alarms - hits_random
+                ets = (hits - hits_random) / max(denom, 1e-10) if denom > 0 else 0.0
+
+                # CSI
+                csi_denom = hits + misses + false_alarms
+                csi = hits / max(csi_denom, 1e-10) if csi_denom > 0 else 0.0
+
+                metric_var = f"tp_6hr_{thresh_label}"
+
+                all_rows.append({
+                    "value": fbias,
+                    "lead_time": str(lead_td),
+                    "init_time": "",
+                    "landfall": "",
+                    "target_variable": metric_var,
+                    "metric": "FrequencyBias",
+                    "forecast_source": model_name,
+                    "target_source": "MRMS",
+                    "case_id_number": case.case_id_number,
+                    "event_type": "heavy_precip",
+                })
+                all_rows.append({
+                    "value": ets,
+                    "lead_time": str(lead_td),
+                    "init_time": "",
+                    "landfall": "",
+                    "target_variable": metric_var,
+                    "metric": "EquitableThreatScore",
+                    "forecast_source": model_name,
+                    "target_source": "MRMS",
+                    "case_id_number": case.case_id_number,
+                    "event_type": "heavy_precip",
+                })
+                all_rows.append({
+                    "value": csi,
+                    "lead_time": str(lead_td),
+                    "init_time": "",
+                    "landfall": "",
+                    "target_variable": metric_var,
+                    "metric": "CriticalSuccessIndex",
+                    "forecast_source": model_name,
+                    "target_source": "MRMS",
+                    "case_id_number": case.case_id_number,
+                    "event_type": "heavy_precip",
+                })
+
+    if not all_rows:
+        print("   ⚠️  No heavy precip results produced")
+        return pd.DataFrame()
+
+    results = pd.DataFrame(all_rows)
+    print(f"\n   ✅ Heavy precip evaluation: {len(results)} rows")
+    return results
+
+
+# Composite event types: when one of these events is evaluated,
+# also run the heavy_precip evaluation against MRMS.
+COMPOSITE_EVENTS = {
+    "atmospheric_river": ["heavy_precip"],
+    # Future: "tropical_cyclone": ["heavy_precip"],
+    # Future: "severe_convection": ["heavy_precip"],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2326,6 +2758,33 @@ def main(
     print(f"\n✅ Evaluation complete!")
     print(f"   Results saved to: {output_file}")
     print(f"   Total rows: {len(results)}")
+
+    # --- Composite event sub-evaluations (e.g., heavy precip for AR events) ---
+    composite_subs = COMPOSITE_EVENTS.get(case.event_type, [])
+    if composite_subs:
+        print(f"\n🔗 Composite event: running sub-evaluations for {case.event_type}")
+        for sub_eval_type in composite_subs:
+            if sub_eval_type == "heavy_precip":
+                precip_csv = OUTPUT_DIR / f"case_{case_id}_{case.event_type}_2025_heavy_precip_results.csv"
+                # Use the same models as the main evaluation (local models only for precip)
+                precip_models = [f.name for f in all_forecasts]
+                try:
+                    precip_results = run_heavy_precip_evaluation(
+                        case=case,
+                        model_names=precip_models,
+                        output_file=precip_csv,
+                    )
+                    if not precip_results.empty:
+                        precip_results.to_csv(precip_csv, index=False)
+                        print(f"   Heavy precip results: {precip_csv}")
+                        # Also append to main results
+                        results = pd.concat([results, precip_results], ignore_index=True)
+                        results.to_csv(output_file, index=False)
+                        print(f"   Updated main results: {len(results)} total rows")
+                except Exception as e:
+                    print(f"   ⚠️  Heavy precip evaluation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     # --- Per-station results (only for GHCN target) ---
     if target_type == "ghcn" and len(all_forecasts) > 0:
