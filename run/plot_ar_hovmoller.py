@@ -27,9 +27,34 @@ import xarray as xr
 
 warnings.filterwarnings("ignore")
 
-# Coastal band for California: ~235-240°E (125-120°W)
-COASTAL_LON_MIN = 235.0
-COASTAL_LON_MAX = 240.0
+# Coast-following band: approximate CA/OR/WA coastline as a set of (lat, lon) pairs
+# and take IVT within COAST_BUFFER degrees of this line at each latitude.
+# Longitudes in 0-360 convention (°E).
+COAST_POINTS = np.array([
+    # (lat, lon_E)  — approximate Pacific coast
+    (48.5, 235.5),   # WA coast
+    (47.0, 235.7),
+    (46.0, 236.0),   # OR/WA border
+    (44.0, 236.0),
+    (43.0, 235.7),   # Southern OR
+    (42.0, 235.6),   # OR/CA border
+    (41.0, 235.8),
+    (40.0, 235.7),   # Cape Mendocino
+    (38.0, 237.0),   # Point Reyes
+    (37.0, 237.5),   # SF
+    (36.0, 238.3),   # Monterey
+    (35.0, 239.3),   # Point Conception bend
+    (34.5, 240.0),
+    (34.0, 241.3),   # LA
+    (33.5, 242.0),   # San Diego area
+    (33.0, 242.5),
+    (32.5, 243.0),   # US/Mexico border
+    (30.0, 244.0),   # Northern Baja
+    (28.0, 245.0),   # Mid Baja
+    (26.0, 247.0),   # Southern Baja (tip)
+    (25.0, 248.0),
+])
+COAST_BUFFER = 1.5  # degrees from coast to include
 
 OUTPUT_DIR = Path("/huge/proc/eva/ewb_case_342")
 
@@ -45,18 +70,53 @@ MODEL_DISPLAY = {
 MODEL_ORDER = ["WeatherMesh-4", "IFS", "AIFS", "GFS", "GFS-Ens-Mean"]
 
 
+def _coast_lon_at_lat(lat: float) -> float:
+    """Interpolate coastline longitude (°E) at a given latitude."""
+    coast_lats = COAST_POINTS[:, 0]
+    coast_lons = COAST_POINTS[:, 1]
+    return float(np.interp(lat, coast_lats[::-1], coast_lons[::-1]))
+
+
+def _extract_coast_band(ivt: xr.DataArray) -> xr.DataArray:
+    """Extract max IVT within COAST_BUFFER of the coastline at each latitude.
+
+    Returns DataArray with the longitude dimension removed.
+    """
+    lats = ivt.latitude.values
+    lons = ivt.longitude.values
+    vals = ivt.values  # (..., lat, lon)
+
+    # Build mask: for each lat, only keep lons within COAST_BUFFER of coastline
+    lat_idx = ivt.dims.index("latitude")
+    lon_idx = ivt.dims.index("longitude")
+
+    # Pre-compute coast longitude for each latitude
+    coast_lons = np.array([_coast_lon_at_lat(lat) for lat in lats])
+
+    # Create 2D mask (lat, lon)
+    lon_grid = lons[np.newaxis, :]  # (1, nlon)
+    coast_grid = coast_lons[:, np.newaxis]  # (nlat, 1)
+    mask = np.abs(lon_grid - coast_grid) <= COAST_BUFFER  # (nlat, nlon)
+
+    # Apply mask and take max along longitude
+    # Handle arbitrary leading dims by broadcasting
+    masked = np.where(mask, vals, np.nan)
+    result = np.nanmax(masked, axis=lon_idx)
+
+    # Build new DataArray without the longitude dim
+    new_dims = [d for d in ivt.dims if d != "longitude"]
+    new_coords = {k: v for k, v in ivt.coords.items() if "longitude" not in v.dims and k != "longitude"}
+    return xr.DataArray(result, dims=new_dims, coords=new_coords)
+
+
 def load_era5_hovmoller(cache_dir: Path) -> xr.DataArray:
-    """Load ERA5 truth IVT and compute coastal band max."""
+    """Load ERA5 truth IVT and compute coast-following band max."""
     era5_path = cache_dir / "case_342" / "ERA5" / "derived.nc"
     assert era5_path.exists(), f"ERA5 cache not found: {era5_path}"
 
     ds = xr.open_dataset(era5_path)
     ivt = ds["integrated_vapor_transport"]
-
-    # Subset to coastal band and take max along longitude
-    coastal = ivt.sel(longitude=slice(COASTAL_LON_MIN, COASTAL_LON_MAX))
-    hovmoller = coastal.max(dim="longitude")
-    return hovmoller
+    return _extract_coast_band(ivt)
 
 
 def load_model_cache(cache_dir: Path, model_name: str) -> xr.Dataset | None:
@@ -69,7 +129,7 @@ def load_model_cache(cache_dir: Path, model_name: str) -> xr.Dataset | None:
 
 
 def extract_init_hovmoller(ds: xr.Dataset, init_time: np.datetime64) -> xr.DataArray | None:
-    """Extract IVT coastal-band max Hovmöller for a single init time.
+    """Extract IVT coast-following band max Hovmöller for a single init time.
 
     The cached model data has dims (lead_time, valid_time, latitude, longitude).
     For a given init time, valid_time = init_time + lead_time.
@@ -83,8 +143,7 @@ def extract_init_hovmoller(ds: xr.Dataset, init_time: np.datetime64) -> xr.DataA
     # valid_time for a given init is: init_time + lead_time
     if "lead_time" not in ivt.dims:
         # ERA5 — no lead_time dimension, just return the full valid_time series
-        coastal = ivt.sel(longitude=slice(COASTAL_LON_MIN, COASTAL_LON_MAX))
-        return coastal.max(dim="longitude")
+        return _extract_coast_band(ivt)
 
     lead_times = ivt.lead_time.values
     expected_valid_times = init_time + lead_times
@@ -95,11 +154,11 @@ def extract_init_hovmoller(ds: xr.Dataset, init_time: np.datetime64) -> xr.DataA
     result_valid_times = []
 
     for lt, expected_vt in zip(lead_times, expected_valid_times):
-        # Check if this valid_time exists in the dataset
         if expected_vt in available_valid:
             slice_data = ivt.sel(lead_time=lt, valid_time=expected_vt)
-            coastal = slice_data.sel(longitude=slice(COASTAL_LON_MIN, COASTAL_LON_MAX))
-            results.append(coastal.max(dim="longitude").values)
+            # slice_data has dims (latitude, longitude)
+            coast_band = _extract_coast_band(slice_data)
+            results.append(coast_band.values)
             result_valid_times.append(expected_vt)
 
     if len(results) == 0:
@@ -148,7 +207,7 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
     ncols = 3
     nrows = (n_panels + ncols - 1) // ncols
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 4.2 * nrows),
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 3.4 * nrows),
                               dpi=300, squeeze=False)
 
     # IVT levels for truth panel
@@ -225,23 +284,25 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
         row, col = divmod(idx, ncols)
         axes[row][col].set_visible(False)
 
-    # Two shared colorbars at the bottom
-    fig.subplots_adjust(bottom=0.13, hspace=0.35)
+    # Colorbars: IVT truth on left side (vertical), diff at bottom (horizontal)
+    fig.subplots_adjust(left=0.12, bottom=0.10, hspace=0.30)
 
-    # ERA5 IVT colorbar (left)
-    cbar_ax_ivt = fig.add_axes([0.05, 0.04, 0.38, 0.015])
-    cb_ivt = plt.colorbar(cf_era5, cax=cbar_ax_ivt, orientation="horizontal")
-    cb_ivt.set_label("IVT (kg/m/s)", fontsize=9)
+    # ERA5 IVT colorbar — vertical, on left edge near ERA5 panel (top-left)
+    era5_pos = axes[0][0].get_position()
+    cbar_ax_ivt = fig.add_axes([0.02, era5_pos.y0, 0.012, era5_pos.height])
+    cb_ivt = plt.colorbar(cf_era5, cax=cbar_ax_ivt, orientation="vertical")
+    cb_ivt.set_label("IVT (kg/m/s)", fontsize=8)
+    cb_ivt.ax.tick_params(labelsize=7)
 
-    # Difference colorbar (right)
+    # Difference colorbar — horizontal, centered at bottom
     if last_cf_diff is not None:
-        cbar_ax_diff = fig.add_axes([0.55, 0.04, 0.38, 0.015])
+        cbar_ax_diff = fig.add_axes([0.25, 0.03, 0.5, 0.015])
         cb_diff = plt.colorbar(last_cf_diff, cax=cbar_ax_diff, orientation="horizontal")
         cb_diff.set_label("IVT Difference (kg/m/s)", fontsize=9)
 
     fig.suptitle(
-        f"Hovmöller: IVT Coastal-Band Max — Init {init_label}\n"
-        f"Lon band: {COASTAL_LON_MIN-360:.0f}°W to {COASTAL_LON_MAX-360:.0f}°W | "
+        f"Hovmöller: IVT Coast-Following Band Max — Init {init_label}\n"
+        f"±{COAST_BUFFER:.1f}° from Pacific coastline | "
         f"Case 342: CA Christmas AR",
         fontsize=12, fontweight="bold", y=0.99,
     )
