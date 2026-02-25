@@ -40,12 +40,13 @@ plt.rcParams["font.size"] = 11
 _PASTEL2 = sns.color_palette("Pastel2")   # physical models
 _DEEP = sns.color_palette("deep")         # AI models
 
-# Physical models: IFS, IFS-Ens-Mean, GFS, GFS-Ens-Mean — solid lines, Pastel2
+# Physical models — solid lines, Pastel2
 PHYSICAL_MODELS = {"IFS", "IFS-Ens-Mean", "GFS", "GFS-Ens-Mean"}
 
 # WeatherMesh variants — hardcoded colors, solid lines
 _WM_STYLES = {
     "WeatherMesh-4":             {"color": "#555555", "marker": "D", "linestyle": "-"},
+    "WeatherMesh-4-Ens-Mean":    {"color": "#777777", "marker": "d", "linestyle": "-"},
     "WeatherMesh-4p5-Ens-Mean":  {"color": "#888888", "marker": "P", "linestyle": "-"},
     "WeatherMesh-5c-Ens-Mean":   {"color": "#000000", "marker": "d", "linestyle": "-"},
 }
@@ -120,6 +121,14 @@ VARIABLE_DISPLAY_NAMES = {
     "total_precipitation": "Precipitation",
     "total_precipitation_6hr": "6hr Precipitation",
     "total_precipitation_12hr": "12hr Precipitation",
+    "tp_6hr": "6hr Precip",
+    "tp_6hr_1mm": "6hr Precip (>1mm)",
+    "tp_6hr_2.5mm": "6hr Precip (>2.5mm)",
+    "tp_6hr_5mm": "6hr Precip (>5mm)",
+    "tp_6hr_10mm": "6hr Precip (>10mm)",
+    "tp_6hr_25mm": "6hr Precip (>25mm)",
+    "integrated_vapor_transport": "IVT",
+    "atmospheric_river_land_intersection": "AR Land Intersection",
 }
 
 # Metric name mappings (internal name → display abbreviation)
@@ -138,6 +147,12 @@ METRIC_DISPLAY_NAMES = {
     "AlongTrackError": "Along-Track Error",
     "CrossTrackError": "Cross-Track Error",
     "TotalTrackError": "Total Track Error",
+    "MeanError": "Bias",
+    "CriticalSuccessIndex": "CSI",
+    "FrequencyBias": "Frequency Bias",
+    "EquitableThreatScore": "ETS",
+    "SpatialDisplacement": "Spatial Displacement",
+    "EarlySignal": "Early Signal",
     # Lowercase versions (as they appear in CSV)
     "landfall_displacement": "Landfall Distance Error",
     "landfall_time_me": "Landfall Time Error",
@@ -164,6 +179,14 @@ VARIABLE_UNITS = {
     "total_precipitation": "mm",
     "total_precipitation_6hr": "mm",
     "total_precipitation_12hr": "mm",
+    "tp_6hr": "mm",
+    "tp_6hr_1mm": "",
+    "tp_6hr_2.5mm": "",
+    "tp_6hr_5mm": "",
+    "tp_6hr_10mm": "",
+    "tp_6hr_25mm": "",
+    "integrated_vapor_transport": "kg/m/s",
+    "atmospheric_river_land_intersection": "",
 }
 
 # Special metrics that don't need variable units (they have their own)
@@ -215,6 +238,9 @@ EVENT_TIMING_METRICS = {
     "freeze_peak_timing_rmse",
 }
 
+# Metrics that should draw a bold reference line at 1.0 (perfect score).
+UNITY_REFERENCE_METRICS = {"FrequencyBias"}
+
 TRACK_ERROR_METRICS = {
     "along_track_error",
     "cross_track_error",
@@ -226,6 +252,7 @@ TRACK_ERROR_METRICS = {
 
 # Metrics whose values can be positive or negative — always draw a bold 0-line.
 SIGNED_METRICS = TRACK_ERROR_METRICS | {
+    "MeanError",
     "heat_wave_onset_error",
     "heat_wave_end_error",
     "heat_wave_duration_error",
@@ -643,30 +670,136 @@ def plot_metric_by_leadtime(
     output_dir: Path,
     case_label: str = "",
 ):
-    """Plot a metric as a function of lead time."""
+    """Plot a metric as a function of lead time.
+
+    When the metric spans multiple target_variables (e.g. FrequencyBias for
+    tp_6hr_1mm, tp_6hr_5mm, etc.), a separate plot is created for each variable.
+    """
     metric_df = df[df["metric_name"] == metric_name].copy()
-    
+
     if len(metric_df) == 0:
         print(f"  ⚠️  No data for {metric_name}, skipping")
         return
-    
+
     # Skip if no lead_time data (e.g., landfall metrics)
     if "lead_time" not in metric_df.columns or metric_df["lead_time"].isna().all():
         print(f"  ⚠️  No lead_time data for {metric_name}, skipping lead time plot")
         return
-    
+
     # Filter out rows with empty lead_time
     metric_df = metric_df[metric_df["lead_time"].notna() & (metric_df["lead_time"] != "")]
-    
+
     if len(metric_df) == 0:
         print(f"  ⚠️  No valid lead_time data for {metric_name}, skipping lead time plot")
         return
-    
-    # Get the variable name (should be consistent within one metric)
+
+    # Split by target_variable if multiple exist
     if "target_variable" in metric_df.columns:
-        variable = metric_df["target_variable"].iloc[0]
+        variables = sorted(metric_df["target_variable"].dropna().unique())
     else:
-        variable = "unknown"
+        variables = ["unknown"]
+
+    if len(variables) > 1:
+        # Multi-panel plot: one subplot per variable
+        _plot_metric_by_leadtime_multipanel(
+            metric_df, metric_name, variables, output_dir, case_label,
+        )
+    else:
+        variable = variables[0]
+        _plot_metric_by_leadtime_single(metric_df, metric_name, variable, output_dir, case_label)
+
+
+def _plot_metric_by_leadtime_multipanel(
+    metric_df: pd.DataFrame,
+    metric_name: str,
+    variables: list[str],
+    output_dir: Path,
+    case_label: str = "",
+):
+    """Plot a multi-panel figure with one subplot per target_variable."""
+    ncols = min(len(variables), 5)
+    nrows = (len(variables) + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 4.5 * nrows),
+                              dpi=300, sharey=True, squeeze=False)
+
+    metric_display = METRIC_DISPLAY_NAMES.get(metric_name, metric_name.replace("_", " ").title())
+    prefix = f"{case_label}_" if case_label else ""
+
+    for idx, variable in enumerate(variables):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+
+        var_df = metric_df[metric_df["target_variable"] == variable].copy()
+        if "lead_time_hours" not in var_df.columns:
+            try:
+                var_df["lead_time_hours"] = (
+                    pd.to_timedelta(var_df["lead_time"]).dt.total_seconds() / 3600
+                )
+            except Exception:
+                continue
+
+        grouped = (
+            var_df.groupby(["forecast_name", "lead_time_hours"])["metric_value"]
+            .mean()
+            .reset_index()
+        )
+        grouped["lead_time_days"] = grouped["lead_time_hours"] / 24.0
+
+        for forecast in order_forecasts(grouped["forecast_name"].unique()):
+            fdata = grouped[grouped["forecast_name"] == forecast]
+            style = get_model_style(forecast)
+            draw = get_model_plot_params(forecast, base_markersize=5)
+            ax.plot(
+                fdata["lead_time_days"], fdata["metric_value"],
+                label=forecast,
+                color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=draw["linewidth"] * 0.8,
+                markersize=draw["markersize"] * 0.7, alpha=draw["alpha"],
+            )
+
+        var_display = VARIABLE_DISPLAY_NAMES.get(variable, variable)
+        ax.set_title(var_display, fontweight="bold", fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        if metric_name in SIGNED_METRICS:
+            ax.axhline(0.0, color="black", linewidth=1.5, alpha=0.7, zorder=1)
+        if metric_name in UNITY_REFERENCE_METRICS:
+            ax.axhline(1.0, color="black", linewidth=1.5, alpha=0.7, linestyle="--", zorder=1)
+
+        if row == nrows - 1:
+            ax.set_xlabel("Lead Time (days)", fontsize=9)
+        if col == 0:
+            ax.set_ylabel(metric_display, fontsize=10, fontweight="bold")
+
+    # Hide unused subplots
+    for idx in range(len(variables), nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    axes[0][0].legend(fontsize=7, loc="best")
+
+    fig.suptitle(
+        f"{metric_display} vs Lead Time — by threshold",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    filename_metric = metric_display.lower().replace(" ", "_")
+    output_file = output_dir / f"{prefix}{filename_metric}_multipanel_by_leadtime.png"
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  ✓ Saved {output_file.name} (multi-panel)")
+
+
+def _plot_metric_by_leadtime_single(
+    metric_df: pd.DataFrame,
+    metric_name: str,
+    variable: str,
+    output_dir: Path,
+    case_label: str = "",
+):
+    """Plot a single metric-variable combination vs lead time."""
     
     # Convert lead_time to hours
     if "lead_time_hours" not in metric_df.columns:
@@ -743,7 +876,9 @@ def plot_metric_by_leadtime(
     ax.grid(True, alpha=0.3)
     if metric_name in SIGNED_METRICS:
         ax.axhline(0.0, color="black", linewidth=2, alpha=0.8, zorder=1)
-    
+    if metric_name in UNITY_REFERENCE_METRICS:
+        ax.axhline(1.0, color="black", linewidth=2, alpha=0.8, linestyle="--", zorder=1)
+
     # Save with case label in filename
     prefix = f"{case_label}_" if case_label else ""
     filename_label = get_filename_safe_label(variable, metric_name)
@@ -791,8 +926,10 @@ def plot_metric_by_leadtime(
     ax.grid(True, alpha=0.3)
     if metric_name in SIGNED_METRICS:
         ax.axhline(0.0, color="black", linewidth=2, alpha=0.8, zorder=1)
+    if metric_name in UNITY_REFERENCE_METRICS:
+        ax.axhline(1.0, color="black", linewidth=2, alpha=0.8, linestyle="--", zorder=1)
     ax.set_xlim(0, 4)
-    
+
     # Save zoomed version
     output_file_zoomed = output_dir / f"{prefix}{filename_label}_by_leadtime_0-96h.png"
     plt.tight_layout()
@@ -810,7 +947,11 @@ def plot_metric_by_validtime(
     landfall_times: list[tuple] | None = None,
     event_times: list[tuple[str, pd.Timestamp]] | None = None,
 ):
-    """Plot a metric as a function of valid time."""
+    """Plot a metric as a function of valid time.
+
+    When the metric spans multiple target_variables, a separate plot is
+    created for each variable.
+    """
     metric_df = df[df["metric_name"] == metric_name].copy()
     if len(metric_df) == 0:
         return
@@ -830,10 +971,33 @@ def plot_metric_by_validtime(
         print(f"  ⚠️  Could not parse valid_time for {metric_name}, skipping valid time plot")
         return
 
+    # Split by target_variable if multiple exist
     if "target_variable" in metric_df.columns:
-        variable = metric_df["target_variable"].iloc[0]
+        variables = metric_df["target_variable"].dropna().unique()
     else:
-        variable = "unknown"
+        variables = ["unknown"]
+
+    for variable in variables:
+        if "target_variable" in metric_df.columns and len(variables) > 1:
+            var_df = metric_df[metric_df["target_variable"] == variable].copy()
+        else:
+            var_df = metric_df
+        _plot_metric_by_validtime_single(
+            var_df, metric_name, variable, output_dir, case_label,
+            landfall_times=landfall_times, event_times=event_times,
+        )
+
+
+def _plot_metric_by_validtime_single(
+    metric_df: pd.DataFrame,
+    metric_name: str,
+    variable: str,
+    output_dir: Path,
+    case_label: str = "",
+    landfall_times: list[tuple] | None = None,
+    event_times: list[tuple[str, pd.Timestamp]] | None = None,
+):
+    """Plot a single metric-variable combination vs valid time."""
 
     grouped = (
         metric_df.groupby(["forecast_name", "valid_time"])["metric_value"]
@@ -1275,13 +1439,9 @@ def plot_metric_by_inittime(
     event_times: list[tuple[str, pd.Timestamp]] | None = None,
 ):
     """Plot a metric as a function of initialization time.
-    
-    Args:
-        df: Results dataframe
-        metric_name: Name of metric to plot
-        output_dir: Directory to save plots
-        case_label: Label for filename
-        landfall_times: List of (landfall_id, datetime) tuples for observed landfalls
+
+    When the metric spans multiple target_variables, a separate plot is
+    created for each variable.
     """
     metric_df = df[df["metric_name"] == metric_name].copy()
 
@@ -1298,10 +1458,35 @@ def plot_metric_by_inittime(
         print(f"  ⚠️  No valid init_time data for {metric_name}, skipping init time plot")
         return
 
+    # Split by target_variable if multiple exist
     if "target_variable" in metric_df.columns:
-        variable = metric_df["target_variable"].iloc[0]
+        variables = metric_df["target_variable"].dropna().unique()
     else:
-        variable = "unknown"
+        variables = ["unknown"]
+
+    for variable in variables:
+        if "target_variable" in metric_df.columns and len(variables) > 1:
+            var_df = metric_df[metric_df["target_variable"] == variable].copy()
+        else:
+            var_df = metric_df
+        _plot_metric_by_inittime_single(
+            var_df, metric_name, variable, output_dir, case_label,
+            landfall_times=landfall_times, min_init_time=min_init_time,
+            event_times=event_times,
+        )
+
+
+def _plot_metric_by_inittime_single(
+    metric_df: pd.DataFrame,
+    metric_name: str,
+    variable: str,
+    output_dir: Path,
+    case_label: str = "",
+    landfall_times: list[tuple] = None,
+    min_init_time: pd.Timestamp | None = None,
+    event_times: list[tuple[str, pd.Timestamp]] | None = None,
+):
+    """Plot a single metric-variable combination vs init time."""
 
     metric_df["init_time"] = pd.to_datetime(metric_df["init_time"], errors="coerce")
     metric_df = metric_df[metric_df["init_time"].notna()].copy()
