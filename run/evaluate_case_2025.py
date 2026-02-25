@@ -1108,7 +1108,10 @@ def get_variables_for_event_type(event_type: str) -> list:
     elif event_type == "atmospheric_river":
         return [
             ewb.derived.AtmosphericRiverVariables(
-                output_variables=["atmospheric_river_land_intersection"]
+                output_variables=[
+                    "atmospheric_river_land_intersection",
+                    "integrated_vapor_transport",
+                ]
             )
         ]
     elif event_type == "heat_wave":
@@ -1155,7 +1158,9 @@ def get_metrics_for_event_type(event_type: str) -> list:
         ]
     elif event_type == "atmospheric_river":
         ar_var = "atmospheric_river_land_intersection"
+        ivt_var = "integrated_vapor_transport"
         return [
+            # Binary AR detection metrics
             ewb.metrics.CriticalSuccessIndex(
                 forecast_variable=ar_var, target_variable=ar_var,
             ),
@@ -1164,6 +1169,16 @@ def get_metrics_for_event_type(event_type: str) -> list:
             ),
             ewb.metrics.EarlySignal(
                 forecast_variable=ar_var, target_variable=ar_var,
+            ),
+            # IVT intensity metrics
+            ewb.metrics.RootMeanSquaredError(
+                forecast_variable=ivt_var, target_variable=ivt_var,
+            ),
+            ewb.metrics.MeanAbsoluteError(
+                forecast_variable=ivt_var, target_variable=ivt_var,
+            ),
+            ewb.metrics.MeanError(
+                forecast_variable=ivt_var, target_variable=ivt_var,
             ),
         ]
     elif event_type == "heat_wave":
@@ -2167,6 +2182,7 @@ def main(
     max_lead_hours: int = 240,
     target_type: str = "era5",
     ghcn_source: str | None = None,
+    cache_derived_dir: str | None = None,
 ):
     """Run evaluation for a 2025 case."""
     global MAX_LEAD_HOURS
@@ -2294,12 +2310,16 @@ def main(
     else:
         effective_n_jobs = n_jobs
     print(f"   Evaluation workers: n_jobs={effective_n_jobs}")
-    results = ewb_runner.run_evaluation(
+    eval_kwargs = dict(
         n_jobs=effective_n_jobs,
         debug_heat_values=debug_heat_values,
         debug_heat_max_inits=debug_heat_max_inits,
         debug_heat_max_points=debug_heat_max_points,
     )
+    if cache_derived_dir is not None:
+        eval_kwargs["cache_derived_dir"] = cache_derived_dir
+        print(f"   Caching derived variables → {cache_derived_dir}")
+    results = ewb_runner.run_evaluation(**eval_kwargs)
 
     # Save aggregate results
     results.to_csv(output_file, index=False)
@@ -2471,6 +2491,16 @@ if __name__ == "__main__":
             "Defaults to the built-in GCS dataset (2020-2024)."
         ),
     )
+    parser.add_argument(
+        "--cache-derived",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Cache derived variables (IVT, AR mask, etc.) to DIR as NetCDF "
+            "for later bulk plotting. Structure: DIR/case_{id}/{source}/derived.nc"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2492,6 +2522,7 @@ if __name__ == "__main__":
             max_lead_hours=args.max_lead_hours,
             target_type=args.target_type,
             ghcn_source=args.ghcn_source,
+            cache_derived_dir=args.cache_derived,
         )
     except Exception as e:
         print(f"\n❌ EVALUATION FAILED!")
