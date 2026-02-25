@@ -2166,8 +2166,8 @@ def _compute_station_results(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Precipitation thresholds for categorical metrics (in meters, matching zarr units)
-PRECIP_THRESHOLDS_M = [0.001, 0.0025, 0.005, 0.01, 0.025]  # 1, 2.5, 5, 10, 25 mm
-PRECIP_THRESHOLD_LABELS = ["1mm", "2.5mm", "5mm", "10mm", "25mm"]
+PRECIP_THRESHOLDS_M = [0.00025, 0.001, 0.0025, 0.005, 0.01, 0.025]  # 0.25, 1, 2.5, 5, 10, 25 mm
+PRECIP_THRESHOLD_LABELS = ["0.25mm", "1mm", "2.5mm", "5mm", "10mm", "25mm"]
 
 
 def _regrid_mrms_to_025(mrms_da: xr.DataArray, qi_da: xr.DataArray,

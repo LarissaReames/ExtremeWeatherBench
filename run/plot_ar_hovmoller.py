@@ -144,22 +144,18 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
         return None
 
     n_models = len(model_hovs)
-    # Layout: ERA5 on top row (full width), model diffs below (3 per row)
+    n_panels = 1 + n_models  # ERA5 + model diffs
     ncols = 3
-    nrows_models = (n_models + ncols - 1) // ncols
+    nrows = (n_panels + ncols - 1) // ncols
 
-    fig = plt.figure(figsize=(5.5 * ncols, 3.5 + 3.5 * nrows_models), dpi=300)
-
-    # ERA5 truth panel on top (spans full width)
-    ax_era5 = fig.add_axes([0.08, 0.55 + 0.02 * nrows_models,
-                             0.82, 0.30 / (1 + 0.3 * nrows_models)])
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.5 * ncols, 4.2 * nrows),
+                              dpi=300, squeeze=False)
 
     # IVT levels for truth panel
     ivt_levels = np.arange(0, 850, 50)
     cmap_ivt = "YlOrRd"
 
     # Subset ERA5 to the event window relevant to this init
-    # Show from init time to init + 360h
     end_time = init_time + np.timedelta64(360, "h")
     event_end = np.datetime64("2025-12-27T00")
     display_end = min(end_time, event_end)
@@ -167,16 +163,15 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
 
     times_era5 = era5_sub.valid_time.values
     lats = era5_sub.latitude.values
+
+    # Panel 0: ERA5 truth
+    ax_era5 = axes[0][0]
     T_e, L_e = np.meshgrid(times_era5, lats)
     cf_era5 = ax_era5.contourf(T_e, L_e, era5_sub.values.T, levels=ivt_levels,
                                  cmap=cmap_ivt, extend="max")
-    cb_era5 = plt.colorbar(cf_era5, ax=ax_era5, shrink=0.8, pad=0.02)
-    cb_era5.set_label("IVT (kg/m/s)", fontsize=9)
-    ax_era5.set_title("ERA5 (Truth)", fontweight="bold", fontsize=11)
+    # No per-panel colorbar — ERA5 gets a shared one at the bottom too
+    ax_era5.set_title("ERA5 (Truth)", fontweight="bold", fontsize=10)
     ax_era5.set_ylabel("Latitude (°N)")
-    ax_era5.xaxis.set_major_formatter(mdates.DateFormatter("%b %d %HZ"))
-    ax_era5.xaxis.set_major_locator(mdates.HourLocator(byhour=[0, 12]))
-    plt.setp(ax_era5.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
     for spine in ax_era5.spines.values():
         spine.set_edgecolor("#DAA520")
         spine.set_linewidth(2.5)
@@ -187,29 +182,16 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
     cmap_diff = "RdBu_r"
     norm_diff = mcolors.TwoSlopeNorm(vmin=-400, vcenter=0, vmax=400)
 
-    # Create model subplot axes
-    left_margin = 0.08
-    right_margin = 0.92
-    bottom = 0.08
-    top = 0.50
-    hspace = 0.12
-    wspace = 0.08
-
-    panel_w = (right_margin - left_margin - (ncols - 1) * wspace) / ncols
-    panel_h = (top - bottom - (nrows_models - 1) * hspace) / nrows_models
-
     last_cf_diff = None
     for i, (name, hov) in enumerate(model_hovs.items()):
-        row = i // ncols
-        col = i % ncols
-        x0 = left_margin + col * (panel_w + wspace)
-        y0 = top - (row + 1) * panel_h - row * hspace
-        ax = fig.add_axes([x0, y0, panel_w, panel_h])
+        panel_idx = i + 1  # ERA5 is panel 0
+        row = panel_idx // ncols
+        col = panel_idx % ncols
+        ax = axes[row][col]
 
         # Compute difference: model - ERA5 at matched valid times
         model_times = hov.valid_time.values
         era5_at_model = era5_hov.sel(valid_time=model_times, method="nearest")
-
         diff = hov.values - era5_at_model.values
 
         T_m, L_m = np.meshgrid(model_times, lats)
@@ -218,7 +200,6 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
         last_cf_diff = cf_diff
 
         display = MODEL_DISPLAY.get(name, {"label": name})
-        # Compute forecast hour range for this model
         fhr_min = int((model_times[0] - init_time) / np.timedelta64(1, "h"))
         fhr_max = int((model_times[-1] - init_time) / np.timedelta64(1, "h"))
         ax.set_title(f"{display['label']} − ERA5\nF{fhr_min:03d}–F{fhr_max:03d}",
@@ -226,21 +207,43 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
 
         if col == 0:
             ax.set_ylabel("Lat (°N)", fontsize=9)
+
+    # Format all axes: hide x-axis labels on non-bottom rows to prevent overlap
+    for idx in range(n_panels):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
         ax.xaxis.set_major_locator(mdates.DayLocator())
-        plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
+        is_bottom = (row == nrows - 1) or not axes[row + 1][col].get_visible() if row < nrows - 1 else True
+        if is_bottom:
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha="right", fontsize=8)
+        else:
+            ax.tick_params(labelbottom=False)
 
-    # Colorbar for differences
+    # Hide unused subplots
+    for idx in range(n_panels, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    # Two shared colorbars at the bottom
+    fig.subplots_adjust(bottom=0.13, hspace=0.35)
+
+    # ERA5 IVT colorbar (left)
+    cbar_ax_ivt = fig.add_axes([0.05, 0.04, 0.38, 0.015])
+    cb_ivt = plt.colorbar(cf_era5, cax=cbar_ax_ivt, orientation="horizontal")
+    cb_ivt.set_label("IVT (kg/m/s)", fontsize=9)
+
+    # Difference colorbar (right)
     if last_cf_diff is not None:
-        cbar_ax = fig.add_axes([0.25, 0.02, 0.5, 0.015])
-        cb = plt.colorbar(last_cf_diff, cax=cbar_ax, orientation="horizontal")
-        cb.set_label("IVT Difference (kg/m/s)", fontsize=9)
+        cbar_ax_diff = fig.add_axes([0.55, 0.04, 0.38, 0.015])
+        cb_diff = plt.colorbar(last_cf_diff, cax=cbar_ax_diff, orientation="horizontal")
+        cb_diff.set_label("IVT Difference (kg/m/s)", fontsize=9)
 
     fig.suptitle(
         f"Hovmöller: IVT Coastal-Band Max — Init {init_label}\n"
         f"Lon band: {COASTAL_LON_MIN-360:.0f}°W to {COASTAL_LON_MAX-360:.0f}°W | "
         f"Case 342: CA Christmas AR",
-        fontsize=12, fontweight="bold", y=0.98,
+        fontsize=12, fontweight="bold", y=0.99,
     )
 
     fname = output_dir / f"ar_hovmoller_init_{init_time_str.replace(':', '').replace('T', '_')}.png"

@@ -122,6 +122,7 @@ VARIABLE_DISPLAY_NAMES = {
     "total_precipitation_6hr": "6hr Precipitation",
     "total_precipitation_12hr": "12hr Precipitation",
     "tp_6hr": "6hr Precip",
+    "tp_6hr_0.25mm": "6hr Precip (>0.25mm)",
     "tp_6hr_1mm": "6hr Precip (>1mm)",
     "tp_6hr_2.5mm": "6hr Precip (>2.5mm)",
     "tp_6hr_5mm": "6hr Precip (>5mm)",
@@ -180,6 +181,7 @@ VARIABLE_UNITS = {
     "total_precipitation_6hr": "mm",
     "total_precipitation_12hr": "mm",
     "tp_6hr": "mm",
+    "tp_6hr_0.25mm": "",
     "tp_6hr_1mm": "",
     "tp_6hr_2.5mm": "",
     "tp_6hr_5mm": "",
@@ -664,6 +666,20 @@ def compute_consensus_init_start(
     return pd.Timestamp(eligible.index.min())
 
 
+def _sort_threshold_variables(variables) -> list[str]:
+    """Sort threshold variables numerically (e.g. tp_6hr_0.25mm < tp_6hr_1mm < tp_6hr_10mm).
+
+    Falls back to alphabetical for non-threshold variables.
+    """
+    import re
+
+    def _extract_threshold(v: str) -> float:
+        m = re.search(r"(\d+\.?\d*)mm$", v)
+        return float(m.group(1)) if m else float("inf")
+
+    return sorted(variables, key=_extract_threshold)
+
+
 def plot_metric_by_leadtime(
     df: pd.DataFrame,
     metric_name: str,
@@ -695,7 +711,7 @@ def plot_metric_by_leadtime(
 
     # Split by target_variable if multiple exist
     if "target_variable" in metric_df.columns:
-        variables = sorted(metric_df["target_variable"].dropna().unique())
+        variables = _sort_threshold_variables(metric_df["target_variable"].dropna().unique())
     else:
         variables = ["unknown"]
 
@@ -717,7 +733,7 @@ def _plot_metric_by_leadtime_multipanel(
     case_label: str = "",
 ):
     """Plot a multi-panel figure with one subplot per target_variable."""
-    ncols = min(len(variables), 5)
+    ncols = min(len(variables), 3)
     nrows = (len(variables) + ncols - 1) // ncols
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(4.5 * ncols, 4.5 * nrows),
@@ -973,7 +989,7 @@ def plot_metric_by_validtime(
 
     # Split by target_variable if multiple exist
     if "target_variable" in metric_df.columns:
-        variables = metric_df["target_variable"].dropna().unique()
+        variables = _sort_threshold_variables(metric_df["target_variable"].dropna().unique())
     else:
         variables = ["unknown"]
 
@@ -1460,7 +1476,7 @@ def plot_metric_by_inittime(
 
     # Split by target_variable if multiple exist
     if "target_variable" in metric_df.columns:
-        variables = metric_df["target_variable"].dropna().unique()
+        variables = _sort_threshold_variables(metric_df["target_variable"].dropna().unique())
     else:
         variables = ["unknown"]
 
