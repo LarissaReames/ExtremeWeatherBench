@@ -82,6 +82,7 @@ from extremeweatherbench.inputs import (
     IBTRACS_URI,
     LSR,
     LSR_URI,
+    MRMS,
     PPH,
     PPH_URI,
     CIRA_metadata_variable_mapping,

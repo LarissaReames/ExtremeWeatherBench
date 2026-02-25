@@ -54,12 +54,12 @@ def plot_continuous_metrics(df: pd.DataFrame, output_dir: Path) -> list[str]:
     for ax, metric, title in zip(axes, metrics, titles):
         for model in MODEL_ORDER:
             m = cont[(cont["forecast_source"] == model) & (cont["metric"] == metric)]
-            m = m.sort_values("lead_h")
             if len(m) == 0:
                 continue
-            ax.plot(m["lead_h"], m["value"],
+            agg = m.groupby("lead_h")["value"].mean().sort_index()
+            ax.plot(agg.index, agg.values,
                     color=COLORS[model], label=model,
-                    linewidth=1.8, marker="o", markersize=3)
+                    linewidth=1.8)
 
         ax.set_xlabel("Forecast Hour")
         ax.set_ylabel(title)
@@ -101,12 +101,13 @@ def plot_frequency_bias(df: pd.DataFrame, output_dir: Path) -> list[str]:
     for ax, thresh, label in zip(axes, thresholds, labels):
         sub = fbias[fbias["target_variable"] == thresh]
         for model in MODEL_ORDER:
-            m = sub[sub["forecast_source"] == model].sort_values("lead_h")
+            m = sub[sub["forecast_source"] == model]
             if len(m) == 0:
                 continue
-            ax.plot(m["lead_h"], m["value"],
+            agg = m.groupby("lead_h")["value"].mean().sort_index()
+            ax.plot(agg.index, agg.values,
                     color=COLORS[model], label=model,
-                    linewidth=1.5, marker="o", markersize=2)
+                    linewidth=1.5)
 
         ax.axhline(1.0, color="black", linewidth=0.8, linestyle="--", alpha=0.7)
         ax.set_xlabel("Forecast Hour", fontsize=9)
@@ -153,12 +154,13 @@ def plot_skill_scores(df: pd.DataFrame, output_dir: Path) -> list[str]:
             sub = sub_metric[sub_metric["target_variable"] == thresh]
 
             for model in MODEL_ORDER:
-                m = sub[sub["forecast_source"] == model].sort_values("lead_h")
+                m = sub[sub["forecast_source"] == model]
                 if len(m) == 0:
                     continue
-                ax.plot(m["lead_h"], m["value"],
+                agg = m.groupby("lead_h")["value"].mean().sort_index()
+                ax.plot(agg.index, agg.values,
                         color=COLORS[model], label=model,
-                        linewidth=1.5, marker="o", markersize=2)
+                        linewidth=1.5)
 
             ax.set_xlim(0, 366)
             ax.set_ylim(-0.05, 0.7)
