@@ -312,18 +312,21 @@ def plot_init_hovmoller(cache_dir: Path, init_time_str: str, output_dir: Path = 
         axes[row][col].set_visible(False)
 
     # Colorbars: IVT truth on left side (vertical), diff at bottom (horizontal)
-    fig.subplots_adjust(left=0.12, bottom=0.10, hspace=0.30)
+    fig.subplots_adjust(left=0.14, bottom=0.12, hspace=0.30)
 
-    # ERA5 IVT colorbar — vertical, on left edge near ERA5 panel (top-left)
+    # ERA5 IVT colorbar — vertical, tight to left of ERA5 panel
+    # Labels and title on the LEFT side of the colorbar
     era5_pos = axes[0][0].get_position()
-    cbar_ax_ivt = fig.add_axes([0.02, era5_pos.y0, 0.012, era5_pos.height])
+    cbar_ax_ivt = fig.add_axes([era5_pos.x0 - 0.04, era5_pos.y0, 0.012, era5_pos.height])
     cb_ivt = plt.colorbar(cf_era5, cax=cbar_ax_ivt, orientation="vertical")
+    cb_ivt.ax.yaxis.set_ticks_position("left")
+    cb_ivt.ax.yaxis.set_label_position("left")
     cb_ivt.set_label("IVT (kg/m/s)", fontsize=8)
     cb_ivt.ax.tick_params(labelsize=7)
 
-    # Difference colorbar — horizontal, centered at bottom
+    # Difference colorbar — horizontal, centered at bottom (nudged down for clearance)
     if last_cf_diff is not None:
-        cbar_ax_diff = fig.add_axes([0.25, 0.03, 0.5, 0.015])
+        cbar_ax_diff = fig.add_axes([0.25, 0.01, 0.5, 0.015])
         cb_diff = plt.colorbar(last_cf_diff, cax=cbar_ax_diff, orientation="horizontal")
         cb_diff.set_label("IVT Difference (kg/m/s)", fontsize=9)
 
