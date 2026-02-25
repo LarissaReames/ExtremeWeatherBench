@@ -2650,6 +2650,34 @@ def main(
     print(f"   Duration: {(case.end_date - case.start_date).days} days")
     print(f"   Max lead time: {MAX_LEAD_HOURS} h ({MAX_LEAD_HOURS // 24} days)")
 
+    # ── Standalone heavy_precip: skip the full EWB pipeline, run MRMS eval directly ──
+    if case.event_type == "heavy_precip":
+        print("\n🌧️  Standalone heavy_precip event — running MRMS evaluation directly")
+        model_names = list(LOCAL_MODELS)
+        if only_model:
+            model_names = [only_model]
+        try:
+            results = run_heavy_precip_evaluation(
+                case=case,
+                model_names=model_names,
+                output_file=output_file,
+            )
+            if not results.empty:
+                results.to_csv(output_file, index=False)
+                print(f"\n✅ Heavy precip evaluation complete!")
+                print(f"   Results saved to: {output_file}")
+                print(f"   Total rows: {len(results)}")
+                print(f"\n📈 Sample results:")
+                print(results.head(10))
+            else:
+                print("\n⚠️  No heavy precip results produced (no MRMS/model overlap?)")
+        except Exception as e:
+            print(f"\n❌ Heavy precip evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        return
+
     if clear_tc_track_cache_flag and case.event_type == "tropical_cyclone":
         clear_tc_track_cache(case.case_id_number)
 

@@ -4102,3 +4102,15 @@
       longitude_min: 200.0
       longitude_max: 250.0
   event_type: atmospheric_river
+- case_id_number: 343
+  title: TS Barry Remnants Texas Heavy Rainfall
+  start_date: 2025-06-28 00:00:00
+  end_date: 2025-07-06 12:00:00
+  location:
+    type: bounded_region
+    parameters:
+      latitude_min: 25.0
+      latitude_max: 36.0
+      longitude_min: 255.0
+      longitude_max: 275.0
+  event_type: heavy_precip
