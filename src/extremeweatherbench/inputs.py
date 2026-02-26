@@ -1140,8 +1140,13 @@ class MRMS(TargetBase):
     variables: Sequence[Union[str, "derived.DerivedVariable"]] = dataclasses.field(
         default_factory=lambda: ["tp_6hr"]
     )
+    _cached_ds: Optional[xr.Dataset] = dataclasses.field(
+        default=None, repr=False, compare=False,
+    )
 
     def _open_data_from_source(self) -> IncomingDataInput:
+        if self._cached_ds is not None:
+            return self._cached_ds.copy(deep=False)
         from datetime import timedelta
 
         if self.start_date is None or self.end_date is None:
@@ -1183,7 +1188,7 @@ class MRMS(TargetBase):
         lats = arrays[0].latitude.values
         lons = arrays[0].longitude.values
 
-        return xr.Dataset(
+        ds = xr.Dataset(
             {"tp_6hr": (["valid_time", "latitude", "longitude"], stacked)},
             coords={
                 "valid_time": np.array(valid_times, dtype="datetime64[ns]"),
@@ -1191,6 +1196,8 @@ class MRMS(TargetBase):
                 "longitude": lons,
             },
         )
+        object.__setattr__(self, "_cached_ds", ds)
+        return ds
 
     def subset_data_to_case(
         self,

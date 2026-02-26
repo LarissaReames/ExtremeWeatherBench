@@ -69,8 +69,8 @@ LOCAL_MODELS = [
     "WeatherMesh-4p5-Ens-Mean",
     "WeatherMesh-5c-Ens-Mean",
     "IFS-Ens-Mean",
-    "AIFS-Ens-Mean",
-#    "GFS-Ens-Mean",
+#    "AIFS",
+    "GFS-Ens-Mean",
 ]
 
 # Models with upper-air data (q, u, v at pressure levels) — needed for AR events
@@ -170,7 +170,11 @@ def _local_needed_vars_for_event(event_type: str) -> set[str]:
     return {"t2", "t2m"}
 
 
-def _open_single_local_zarr(zarr_path: Path, needed_vars: set[str]) -> xr.Dataset:
+def _open_single_local_zarr(
+    zarr_path: Path,
+    needed_vars: set[str],
+    bbox: tuple[float, float, float, float] | None = None,
+) -> xr.Dataset:
     """Open one local zarr init and standardise to EWB conventions.
 
     Local zarr structure:
@@ -182,10 +186,17 @@ def _open_single_local_zarr(zarr_path: Path, needed_vars: set[str]) -> xr.Datase
         dims:   lead_time (timedelta), latitude, longitude, level
         coords: init_time (scalar → will become dim after concat)
     """
-    ds = xr.open_zarr(str(zarr_path), chunks="auto")
-    # Only keep the variables we need to avoid loading the full ~19 GB file
+    ds = xr.open_zarr(str(zarr_path), chunks=None)
     keep = [v for v in needed_vars if v in ds.data_vars]
     ds = ds[keep]
+
+    if bbox is not None:
+        lat_min, lat_max, lon_min, lon_max = bbox
+        lats = ds["lat"].values
+        if lats[0] > lats[-1]:
+            ds = ds.sel(lat=slice(lat_max, lat_min), lon=slice(lon_min, lon_max))
+        else:
+            ds = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
 
     # Convert step (hours as float32) → lead_time (timedelta64)
     step_hours = ds["step"].values.astype(float)
@@ -232,6 +243,7 @@ def assemble_local_forecast(
     end_date: datetime,
     event_type: str,
     lookback_days: int = 15,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> xr.Dataset:
     """Assemble a multi-init dataset for a local model."""
     paths = _discover_local_inits(
@@ -253,7 +265,7 @@ def assemble_local_forecast(
         try:
             if i == 1 or i % 10 == 0 or i == len(paths):
                 print(f"      [{i}/{len(paths)}] {p.name}", flush=True)
-            ds = _open_single_local_zarr(p, needed_vars=needed_vars)
+            ds = _open_single_local_zarr(p, needed_vars=needed_vars, bbox=bbox)
             # Expand init_time to a dimension for concatenation
             ds = ds.expand_dims("init_time")
             datasets.append(ds)
@@ -1431,6 +1443,17 @@ def _missing_required_variables(ds: xr.Dataset, required_vars: list[str]) -> lis
     return [v for v in required_vars if v not in ds.data_vars]
 
 
+def _case_bbox(case: ewb.IndividualCase, pad: float = 2.0):
+    """Extract (lat_min, lat_max, lon_min, lon_max) from a case's location, or None."""
+    loc = case.location
+    if hasattr(loc, "latitude_min"):
+        return (
+            loc.latitude_min - pad, loc.latitude_max + pad,
+            loc.longitude_min - pad, loc.longitude_max + pad,
+        )
+    return None
+
+
 def load_local_forecasts(
     case: ewb.IndividualCase,
     lookback_days: int | None = None,
@@ -1440,12 +1463,14 @@ def load_local_forecasts(
     forecasts = []
     variables = get_variables_for_event_type(case.event_type)
     required_vars = _required_base_variables(case.event_type)
+    bbox = _case_bbox(case)
 
     # Add TC derived variables if needed
     if case.event_type == "tropical_cyclone":
         variables = variables + [
             ewb.derived.TropicalCycloneTrackVariables(min_track_timesteps=5)
         ]
+        bbox = None  # TC tracks span large areas; don't pre-subset
 
     # AR events need models with upper-air data (q, u, v at pressure levels)
     model_list = LOCAL_MODELS_UPPER_AIR if case.event_type == "atmospheric_river" else LOCAL_MODELS
@@ -1462,6 +1487,7 @@ def load_local_forecasts(
                 case.end_date,
                 event_type=case.event_type,
                 lookback_days=lb,
+                bbox=bbox,
             )
 
             # Apply preprocessing

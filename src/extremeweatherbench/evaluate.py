@@ -445,18 +445,22 @@ def compute_case_operator(
         flush=True,
     )
 
-    # Compute and cache the datasets if cache_dir is set
+    # Materialise dask arrays so metrics don't re-read from disk per metric
     t_cache_compute = time.time()
-    aligned_forecast_ds = utils.maybe_cache_and_compute(
-        aligned_forecast_ds,
-        cache_dir=cache_dir,
-        name=f"{case_operator.case_metadata.case_id_number}_{case_operator.forecast.name}",
-    )
-    aligned_target_ds = utils.maybe_cache_and_compute(
-        aligned_target_ds,
-        cache_dir=cache_dir,
-        name=f"{case_operator.case_metadata.case_id_number}_{case_operator.target.name}",
-    )
+    if cache_dir is not None:
+        aligned_forecast_ds = utils.maybe_cache_and_compute(
+            aligned_forecast_ds,
+            cache_dir=cache_dir,
+            name=f"{case_operator.case_metadata.case_id_number}_{case_operator.forecast.name}",
+        )
+        aligned_target_ds = utils.maybe_cache_and_compute(
+            aligned_target_ds,
+            cache_dir=cache_dir,
+            name=f"{case_operator.case_metadata.case_id_number}_{case_operator.target.name}",
+        )
+    else:
+        aligned_forecast_ds = aligned_forecast_ds.load()
+        aligned_target_ds = aligned_target_ds.load()
     print(
         f"[EVAL] case={case_id} forecast={forecast_name} cache/compute done in "
         f"{time.time()-t_cache_compute:.2f}s",
