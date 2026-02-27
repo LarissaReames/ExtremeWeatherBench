@@ -2249,7 +2249,32 @@ def _compute_station_results(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Precipitation thresholds for categorical metrics (in meters, matching zarr units)
-PRECIP_THRESHOLDS_M = [0.00025, 0.001, 0.0025, 0.005, 0.01, 0.025]  # 0.25, 1, 2.5, 5, 10, 25 mm
+PRECIP_THRESHOLDS_MM = [
+    0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5,
+    7.5, 10, 15, 20, 25, 30, 40, 50,
+]
+PRECIP_THRESHOLDS_M = [t / 1000 for t in PRECIP_THRESHOLDS_MM]
+
+
+def _save_observed_threshold_counts(target, case, output_dir: Path):
+    """Compute and save per-threshold observed grid point counts to a JSON sidecar."""
+    import json
+    try:
+        ds = target._open_data_from_source()
+        ds = target.subset_data_to_case(ds, case)
+        da = ds["tp_6hr"]
+        vals = da.values
+        counts = {}
+        for thresh_m in PRECIP_THRESHOLDS_M:
+            label = f"tp_6hr_{thresh_m * 1000:g}mm"
+            counts[label] = int((vals > thresh_m).sum())
+        counts["total_gridpoints"] = int((~np.isnan(vals)).sum())
+        out_path = output_dir / f"case_{case.case_id_number}_obs_threshold_counts.json"
+        with open(out_path, "w") as f:
+            json.dump(counts, f, indent=2)
+        print(f"   Observed threshold counts saved to: {out_path.name}")
+    except Exception as e:
+        print(f"   ⚠️  Could not compute observed threshold counts: {e}")
 
 
 # Composite event types: when one of these events is evaluated,
@@ -2426,6 +2451,9 @@ def main(
     print(f"\n✅ Evaluation complete!")
     print(f"   Results saved to: {output_file}")
     print(f"   Total rows: {len(results)}")
+
+    if case.event_type == "heavy_precip":
+        _save_observed_threshold_counts(target, case, OUTPUT_DIR)
 
     # --- Composite event sub-evaluations (e.g., heavy precip for AR events) ---
     composite_subs = COMPOSITE_EVENTS.get(case.event_type, [])

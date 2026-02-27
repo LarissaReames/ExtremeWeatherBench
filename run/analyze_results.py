@@ -107,8 +107,37 @@ def _station_color(model: str) -> str:
     style = _assign_style(model)
     return style["color"]
 
+import re as _re
+
+
+def _auto_variable_display(v: str) -> str | None:
+    m = _re.match(r"^(tp_\d+hr)_(\d+\.?\d*)mm$", v)
+    if m:
+        hr = _re.search(r"\d+", m.group(1)).group()
+        return f"{hr}hr Precip (>{m.group(2)}mm)"
+    return None
+
+
+class _AutoVarDict(dict):
+    def get(self, key, default=None):
+        val = super().get(key)
+        if val is not None:
+            return val
+        auto = _auto_variable_display(str(key))
+        return auto if auto is not None else (default if default is not None else key)
+
+
+class _AutoUnitDict(dict):
+    def get(self, key, default=None):
+        val = super().get(key)
+        if val is not None:
+            return val
+        if _re.match(r"^tp_\d+hr_\d+\.?\d*mm$", str(key)):
+            return ""
+        return default if default is not None else ""
+
 # Variable name mappings (internal name → display name)
-VARIABLE_DISPLAY_NAMES = {
+VARIABLE_DISPLAY_NAMES = _AutoVarDict({
     "air_pressure_at_mean_sea_level": "MSLP",
     "surface_air_temperature": "T2m",
     "air_temperature": "Air Temperature",
@@ -122,15 +151,9 @@ VARIABLE_DISPLAY_NAMES = {
     "total_precipitation_6hr": "6hr Precipitation",
     "total_precipitation_12hr": "12hr Precipitation",
     "tp_6hr": "6hr Precip",
-    "tp_6hr_0.25mm": "6hr Precip (>0.25mm)",
-    "tp_6hr_1mm": "6hr Precip (>1mm)",
-    "tp_6hr_2.5mm": "6hr Precip (>2.5mm)",
-    "tp_6hr_5mm": "6hr Precip (>5mm)",
-    "tp_6hr_10mm": "6hr Precip (>10mm)",
-    "tp_6hr_25mm": "6hr Precip (>25mm)",
     "integrated_vapor_transport": "IVT",
     "atmospheric_river_land_intersection": "AR Land Intersection",
-}
+})
 
 # Metric name mappings (internal name → display abbreviation)
 # Note: CSV uses lowercase names, so include both CamelCase and lowercase versions
@@ -167,7 +190,7 @@ METRIC_DISPLAY_NAMES = {
 }
 
 # Units for each variable
-VARIABLE_UNITS = {
+VARIABLE_UNITS = _AutoUnitDict({
     "air_pressure_at_mean_sea_level": "hPa",
     "surface_air_temperature": "K",
     "air_temperature": "K",
@@ -181,15 +204,9 @@ VARIABLE_UNITS = {
     "total_precipitation_6hr": "mm",
     "total_precipitation_12hr": "mm",
     "tp_6hr": "mm",
-    "tp_6hr_0.25mm": "",
-    "tp_6hr_1mm": "",
-    "tp_6hr_2.5mm": "",
-    "tp_6hr_5mm": "",
-    "tp_6hr_10mm": "",
-    "tp_6hr_25mm": "",
     "integrated_vapor_transport": "kg/m/s",
     "atmospheric_river_land_intersection": "",
-}
+})
 
 # Special metrics that don't need variable units (they have their own)
 METRIC_UNITS = {
@@ -680,6 +697,59 @@ def _sort_threshold_variables(variables) -> list[str]:
     return sorted(variables, key=_extract_threshold)
 
 
+_PANEL_THRESHOLDS_MM = {0.1, 0.25, 0.5, 1, 2.5, 5, 10, 25, 50}
+
+
+def _select_panel_thresholds(
+    variables: list[str],
+    metric_df: pd.DataFrame,
+    max_panels: int = 9,
+    zero_frac: float = 0.8,
+) -> list[str]:
+    """Pick a subset of threshold variables suitable for a multipanel plot.
+
+    Keeps thresholds in ``_PANEL_THRESHOLDS_MM``, then trims any threshold
+    where >= *zero_frac* of (model, lead_time) values are essentially zero,
+    and finally caps at *max_panels*.
+    """
+    import re
+
+    def _mm(v: str) -> float | None:
+        m = re.search(r"(\d+\.?\d*)mm$", v)
+        return float(m.group(1)) if m else None
+
+    kept: list[str] = []
+    for v in variables:
+        t = _mm(v)
+        if t is None or t not in _PANEL_THRESHOLDS_MM:
+            continue
+        sub = metric_df[metric_df["target_variable"] == v]
+        vals = sub["metric_value"].dropna()
+        if len(vals) == 0:
+            continue
+        frac_zero = (vals.abs() < 1e-9).mean()
+        if frac_zero >= zero_frac:
+            continue
+        kept.append(v)
+    return kept[:max_panels] if kept else variables[:max_panels]
+
+
+def _load_obs_threshold_counts(output_dir: Path, case_label: str) -> dict:
+    """Load observed threshold counts from JSON sidecar if available."""
+    import json, re
+    m = re.match(r"case(\d+)_", case_label)
+    if not m:
+        return {}
+    path = output_dir.parent / f"case_{m.group(1)}_obs_threshold_counts.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
 def plot_metric_by_leadtime(
     df: pd.DataFrame,
     metric_name: str,
@@ -716,9 +786,11 @@ def plot_metric_by_leadtime(
         variables = ["unknown"]
 
     if len(variables) > 1:
-        # Multi-panel plot: one subplot per variable
+        obs_counts = _load_obs_threshold_counts(output_dir, case_label)
+        panel_vars = _select_panel_thresholds(variables, metric_df)
         _plot_metric_by_leadtime_multipanel(
-            metric_df, metric_name, variables, output_dir, case_label,
+            metric_df, metric_name, panel_vars, output_dir, case_label,
+            obs_counts=obs_counts,
         )
     else:
         variable = variables[0]
@@ -731,6 +803,7 @@ def _plot_metric_by_leadtime_multipanel(
     variables: list[str],
     output_dir: Path,
     case_label: str = "",
+    obs_counts: dict | None = None,
 ):
     """Plot a multi-panel figure with one subplot per target_variable."""
     ncols = min(len(variables), 3)
@@ -775,6 +848,9 @@ def _plot_metric_by_leadtime_multipanel(
             )
 
         var_display = VARIABLE_DISPLAY_NAMES.get(variable, variable)
+        if obs_counts and variable in obs_counts:
+            n = obs_counts[variable]
+            var_display = f"{var_display}  (n={n:,})"
         ax.set_title(var_display, fontweight="bold", fontsize=10)
         ax.grid(True, alpha=0.3)
 
@@ -993,15 +1069,101 @@ def plot_metric_by_validtime(
     else:
         variables = ["unknown"]
 
-    for variable in variables:
-        if "target_variable" in metric_df.columns and len(variables) > 1:
-            var_df = metric_df[metric_df["target_variable"] == variable].copy()
-        else:
-            var_df = metric_df
+    if len(variables) > 1:
+        obs_counts = _load_obs_threshold_counts(output_dir, case_label)
+        panel_vars = _select_panel_thresholds(variables, metric_df)
+        _plot_metric_by_validtime_multipanel(
+            metric_df, metric_name, panel_vars, output_dir, case_label,
+            obs_counts=obs_counts,
+        )
+    else:
+        variable = variables[0]
         _plot_metric_by_validtime_single(
-            var_df, metric_name, variable, output_dir, case_label,
+            metric_df, metric_name, variable, output_dir, case_label,
             landfall_times=landfall_times, event_times=event_times,
         )
+
+
+def _plot_metric_by_validtime_multipanel(
+    metric_df: pd.DataFrame,
+    metric_name: str,
+    variables: list[str],
+    output_dir: Path,
+    case_label: str = "",
+    obs_counts: dict | None = None,
+):
+    """Plot a multi-panel figure with one subplot per target_variable vs valid time."""
+    ncols = min(len(variables), 3)
+    nrows = (len(variables) + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows),
+                              dpi=300, sharey=True, squeeze=False)
+
+    metric_display = METRIC_DISPLAY_NAMES.get(metric_name, metric_name.replace("_", " ").title())
+    prefix = f"{case_label}_" if case_label else ""
+
+    for idx, variable in enumerate(variables):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+
+        var_df = metric_df[metric_df["target_variable"] == variable].copy()
+        var_df["valid_time"] = pd.to_datetime(var_df["valid_time"], errors="coerce")
+        var_df = var_df[var_df["valid_time"].notna()]
+        if len(var_df) == 0:
+            continue
+
+        grouped = (
+            var_df.groupby(["forecast_name", "valid_time"])["metric_value"]
+            .mean()
+            .reset_index()
+        )
+
+        for forecast in order_forecasts(grouped["forecast_name"].unique()):
+            fdata = grouped[grouped["forecast_name"] == forecast].sort_values("valid_time")
+            style = get_model_style(forecast)
+            draw = get_model_plot_params(forecast, base_markersize=4)
+            ax.plot(
+                fdata["valid_time"], fdata["metric_value"],
+                label=forecast,
+                color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=draw["linewidth"] * 0.8,
+                markersize=draw["markersize"] * 0.6, alpha=draw["alpha"],
+            )
+
+        var_display = VARIABLE_DISPLAY_NAMES.get(variable, variable)
+        if obs_counts and variable in obs_counts:
+            var_display = f"{var_display}  (n={obs_counts[variable]:,})"
+        ax.set_title(var_display, fontweight="bold", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="x", rotation=30, labelsize=7)
+
+        if metric_name in SIGNED_METRICS:
+            ax.axhline(0.0, color="black", linewidth=1.5, alpha=0.7, zorder=1)
+        if metric_name in UNITY_REFERENCE_METRICS:
+            ax.axhline(1.0, color="black", linewidth=1.5, alpha=0.7, linestyle="--", zorder=1)
+
+        if row == nrows - 1:
+            ax.set_xlabel("Valid Time", fontsize=9)
+        if col == 0:
+            ax.set_ylabel(metric_display, fontsize=10, fontweight="bold")
+
+    for idx in range(len(variables), nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    axes[0][0].legend(fontsize=7, loc="best")
+
+    fig.suptitle(
+        f"{metric_display} vs Valid Time — by threshold",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    filename_metric = metric_display.lower().replace(" ", "_")
+    output_file = output_dir / f"{prefix}{filename_metric}_multipanel_by_validtime.png"
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  ✓ Saved {output_file.name} (multi-panel)")
 
 
 def _plot_metric_by_validtime_single(
@@ -1480,16 +1642,102 @@ def plot_metric_by_inittime(
     else:
         variables = ["unknown"]
 
-    for variable in variables:
-        if "target_variable" in metric_df.columns and len(variables) > 1:
-            var_df = metric_df[metric_df["target_variable"] == variable].copy()
-        else:
-            var_df = metric_df
+    if len(variables) > 1:
+        obs_counts = _load_obs_threshold_counts(output_dir, case_label)
+        panel_vars = _select_panel_thresholds(variables, metric_df)
+        _plot_metric_by_inittime_multipanel(
+            metric_df, metric_name, panel_vars, output_dir, case_label,
+            obs_counts=obs_counts,
+        )
+    else:
+        variable = variables[0]
         _plot_metric_by_inittime_single(
-            var_df, metric_name, variable, output_dir, case_label,
+            metric_df, metric_name, variable, output_dir, case_label,
             landfall_times=landfall_times, min_init_time=min_init_time,
             event_times=event_times,
         )
+
+
+def _plot_metric_by_inittime_multipanel(
+    metric_df: pd.DataFrame,
+    metric_name: str,
+    variables: list[str],
+    output_dir: Path,
+    case_label: str = "",
+    obs_counts: dict | None = None,
+):
+    """Plot a multi-panel figure with one subplot per target_variable vs init time."""
+    ncols = min(len(variables), 3)
+    nrows = (len(variables) + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows),
+                              dpi=300, sharey=True, squeeze=False)
+
+    metric_display = METRIC_DISPLAY_NAMES.get(metric_name, metric_name.replace("_", " ").title())
+    prefix = f"{case_label}_" if case_label else ""
+
+    for idx, variable in enumerate(variables):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+
+        var_df = metric_df[metric_df["target_variable"] == variable].copy()
+        var_df["init_time"] = pd.to_datetime(var_df["init_time"], errors="coerce")
+        var_df = var_df[var_df["init_time"].notna()]
+        if len(var_df) == 0:
+            continue
+
+        grouped = (
+            var_df.groupby(["forecast_name", "init_time"])["metric_value"]
+            .mean()
+            .reset_index()
+        )
+
+        for forecast in order_forecasts(grouped["forecast_name"].unique()):
+            fdata = grouped[grouped["forecast_name"] == forecast].sort_values("init_time")
+            style = get_model_style(forecast)
+            draw = get_model_plot_params(forecast, base_markersize=4)
+            ax.plot(
+                fdata["init_time"], fdata["metric_value"],
+                label=forecast,
+                color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=draw["linewidth"] * 0.8,
+                markersize=draw["markersize"] * 0.6, alpha=draw["alpha"],
+            )
+
+        var_display = VARIABLE_DISPLAY_NAMES.get(variable, variable)
+        if obs_counts and variable in obs_counts:
+            var_display = f"{var_display}  (n={obs_counts[variable]:,})"
+        ax.set_title(var_display, fontweight="bold", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis="x", rotation=30, labelsize=7)
+
+        if metric_name in SIGNED_METRICS:
+            ax.axhline(0.0, color="black", linewidth=1.5, alpha=0.7, zorder=1)
+        if metric_name in UNITY_REFERENCE_METRICS:
+            ax.axhline(1.0, color="black", linewidth=1.5, alpha=0.7, linestyle="--", zorder=1)
+
+        if row == nrows - 1:
+            ax.set_xlabel("Init Time", fontsize=9)
+        if col == 0:
+            ax.set_ylabel(metric_display, fontsize=10, fontweight="bold")
+
+    for idx in range(len(variables), nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    axes[0][0].legend(fontsize=7, loc="best")
+
+    fig.suptitle(
+        f"{metric_display} vs Init Time — by threshold",
+        fontsize=13, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    filename_metric = metric_display.lower().replace(" ", "_")
+    output_file = output_dir / f"{prefix}{filename_metric}_multipanel_by_inittime.png"
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  ✓ Saved {output_file.name} (multi-panel)")
 
 
 def _plot_metric_by_inittime_single(
@@ -2456,6 +2704,143 @@ def create_model_comparison_table(df: pd.DataFrame, output_dir: Path, case_label
     print("=" * 80)
 
 
+def plot_threshold_metric_vs_threshold(
+    df: pd.DataFrame,
+    metric_name: str,
+    output_dir: Path,
+    case_label: str = "",
+    obs_counts: dict | None = None,
+):
+    """Plot a threshold metric (e.g. FrequencyBias) vs threshold, with panels for lead time bins."""
+    import re
+
+    metric_df = df[df["metric_name"] == metric_name].copy()
+    if len(metric_df) == 0:
+        return
+
+    if "lead_time" not in metric_df.columns or metric_df["lead_time"].isna().all():
+        return
+
+    metric_df = metric_df[metric_df["lead_time"].notna() & (metric_df["lead_time"] != "")]
+    try:
+        metric_df["lead_time_hours"] = (
+            pd.to_timedelta(metric_df["lead_time"]).dt.total_seconds() / 3600
+        )
+    except Exception:
+        return
+
+    def _extract_thresh_mm(v: str) -> float:
+        m = re.search(r"(\d+\.?\d*)mm$", v)
+        return float(m.group(1)) if m else float("nan")
+
+    metric_df["threshold_mm"] = metric_df["target_variable"].apply(_extract_thresh_mm)
+    metric_df = metric_df[metric_df["threshold_mm"].notna()]
+    if len(metric_df) == 0:
+        return
+
+    max_h = metric_df["lead_time_hours"].max()
+    day_edges = list(range(0, int(max_h) + 24, 24))
+    if len(day_edges) <= 7:
+        edges = day_edges
+    else:
+        n_bins = 6
+        step = int(np.ceil(max_h / n_bins / 24)) * 24
+        edges = list(range(0, int(max_h) + step, step))
+    lead_bins = [(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]
+    bin_labels = [f"{lo}-{hi}h" for lo, hi in lead_bins]
+
+    ncols = min(len(lead_bins), 3)
+    nrows = (len(lead_bins) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows),
+                              dpi=300, sharey=True, squeeze=False)
+
+    metric_display = METRIC_DISPLAY_NAMES.get(metric_name, metric_name.replace("_", " ").title())
+    prefix = f"{case_label}_" if case_label else ""
+
+    for idx, ((lo, hi), blabel) in enumerate(zip(lead_bins, bin_labels)):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+
+        bin_df = metric_df[(metric_df["lead_time_hours"] > lo) & (metric_df["lead_time_hours"] <= hi)]
+        if len(bin_df) == 0:
+            ax.set_title(blabel, fontweight="bold", fontsize=10)
+            ax.set_visible(False)
+            continue
+
+        grouped = (
+            bin_df.groupby(["forecast_name", "threshold_mm"])["metric_value"]
+            .mean()
+            .reset_index()
+        )
+
+        for forecast in order_forecasts(grouped["forecast_name"].unique()):
+            fdata = grouped[grouped["forecast_name"] == forecast].sort_values("threshold_mm")
+            style = get_model_style(forecast)
+            draw = get_model_plot_params(forecast, base_markersize=5)
+            ax.plot(
+                fdata["threshold_mm"], fdata["metric_value"],
+                label=forecast,
+                color=style["color"], marker=style["marker"],
+                linestyle=style["linestyle"], linewidth=draw["linewidth"] * 0.8,
+                markersize=draw["markersize"] * 0.7, alpha=draw["alpha"],
+            )
+
+        ax.set_title(blabel, fontweight="bold", fontsize=11)
+        ax.set_xscale("log")
+        ax.grid(True, alpha=0.3)
+        if metric_name in UNITY_REFERENCE_METRICS:
+            ax.axhline(1.0, color="black", linewidth=1.5, alpha=0.7, linestyle="--", zorder=1)
+        if metric_name in SIGNED_METRICS:
+            ax.axhline(0.0, color="black", linewidth=1.5, alpha=0.7, zorder=1)
+
+        if row == nrows - 1:
+            ax.set_xlabel("Threshold (mm)", fontsize=10)
+        if col == 0:
+            ax.set_ylabel(metric_display, fontsize=10, fontweight="bold")
+
+        if obs_counts:
+            ax2 = ax.twiny()
+            thresholds = sorted(grouped["threshold_mm"].unique())
+            tick_positions = thresholds
+            tick_labels = []
+            for t in thresholds:
+                key = f"tp_6hr_{t:g}mm"
+                if key in obs_counts:
+                    n = obs_counts[key]
+                    if n >= 1_000_000:
+                        tick_labels.append(f"{n/1e6:.1f}M")
+                    elif n >= 1_000:
+                        tick_labels.append(f"{n/1e3:.0f}K")
+                    else:
+                        tick_labels.append(str(n))
+                else:
+                    tick_labels.append("")
+            ax2.set_xscale("log")
+            ax2.set_xlim(ax.get_xlim())
+            ax2.set_xticks(tick_positions)
+            ax2.set_xticklabels(tick_labels, fontsize=6, rotation=45)
+            if row == 0:
+                ax2.set_xlabel("Obs count", fontsize=7)
+
+    for idx in range(len(lead_bins), nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    axes[0][0].legend(fontsize=7, loc="best")
+
+    fig.suptitle(
+        f"{metric_display} vs Threshold — by lead time",
+        fontsize=14, fontweight="bold",
+    )
+    plt.tight_layout()
+
+    filename_metric = metric_display.lower().replace(" ", "_")
+    output_file = output_dir / f"{prefix}{filename_metric}_vs_threshold.png"
+    plt.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  ✓ Saved {output_file.name} (FB vs threshold)")
+
+
 def create_all_plots(
     df: pd.DataFrame,
     output_dir: Path,
@@ -2592,7 +2977,18 @@ def create_all_plots(
                 output_dir,
                 case_label,
             )
-    
+
+    # Threshold-metric vs threshold plots (FB, ETS, CSI)
+    threshold_metrics = {"FrequencyBias", "EquitableThreatScore", "CriticalSuccessIndex"}
+    active_threshold_metrics = threshold_metrics & set(metrics)
+    if active_threshold_metrics:
+        obs_counts = _load_obs_threshold_counts(output_dir, case_label)
+        print("\n📊 Plotting threshold metrics vs threshold...")
+        for metric in active_threshold_metrics:
+            plot_threshold_metric_vs_threshold(
+                df, metric, output_dir, case_label, obs_counts=obs_counts,
+            )
+
     # Create plots by init time (with landfall markers)
     print("\n📊 Plotting metrics vs init time...")
     for metric in metrics:

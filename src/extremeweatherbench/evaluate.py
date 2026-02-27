@@ -632,8 +632,17 @@ def _extract_standard_metadata(
     Returns:
         Dictionary of metadata for the output dataframe
     """
+    tv = target_variable
+    if isinstance(metric, metrics.ThresholdMetric) and hasattr(metric, "target_threshold"):
+        thresh = metric.target_threshold
+        tv_str = str(tv)
+        if "tp" in tv_str or "precip" in tv_str.lower():
+            tv = f"{tv_str}_{thresh * 1000:g}mm"
+        else:
+            tv = f"{tv_str}_{thresh:g}"
+
     return {
-        "target_variable": target_variable,
+        "target_variable": tv,
         "metric": metric.name,
         "target_source": case_operator.target.name,
         "forecast_source": case_operator.forecast.name,

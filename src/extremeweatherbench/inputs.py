@@ -1155,8 +1155,10 @@ class MRMS(TargetBase):
             )
 
         root = pathlib.Path(self.source)
-        arrays: list[xr.DataArray] = []
+        raw_slices: list[np.ndarray] = []
         valid_times: list[np.datetime64] = []
+        ref_lat = ref_lon = None
+        flip_lat = False
 
         current = pd.Timestamp(self.start_date)
         end = pd.Timestamp(self.end_date)
@@ -1166,16 +1168,22 @@ class MRMS(TargetBase):
             if zarr_path.exists():
                 try:
                     ds = xr.open_zarr(str(zarr_path), chunks=None)
-                    tp = ds["tp_6hr"].squeeze()
-                    qi = ds["RadarAccumulationQualityIndex_6hr"].squeeze()
-                    regridded = _regrid_mrms_to_025(tp, qi, self.qi_threshold)
-                    arrays.append(regridded)
+                    tp = ds["tp_6hr"].squeeze().values
+                    qi = ds["RadarAccumulationQualityIndex_6hr"].squeeze().values
+                    tp = np.where(qi >= self.qi_threshold, tp, np.nan)
+                    if ref_lat is None:
+                        ref_lat = ds["lat"].values
+                        ref_lon = ds["lon"].values
+                        flip_lat = ref_lat[0] > ref_lat[-1]
+                    if flip_lat:
+                        tp = tp[::-1]
+                    raw_slices.append(tp)
                     valid_times.append(np.datetime64(current))
                 except Exception as e:
                     logger.warning("Failed to load MRMS %s: %s", init_str, e)
             current += timedelta(hours=6)
 
-        if not arrays:
+        if not raw_slices:
             return xr.Dataset(
                 coords={
                     "valid_time": np.array([], dtype="datetime64[ns]"),
@@ -1184,16 +1192,26 @@ class MRMS(TargetBase):
                 }
             )
 
-        stacked = np.stack([a.values for a in arrays], axis=0)
-        lats = arrays[0].latitude.values
-        lons = arrays[0].longitude.values
+        stacked_raw = np.ascontiguousarray(np.stack(raw_slices, axis=0))
+        if flip_lat:
+            ref_lat = ref_lat[::-1]
 
+        da_3d = xr.DataArray(
+            stacked_raw, dims=("time", "y", "x"),
+            coords={"lat": ("y", ref_lat), "lon": ("x", ref_lon)},
+        )
+        regridder = _get_mrms_regridder()
+        regridded = regridder(da_3d, skipna=True, na_thres=0.5)
+
+        dst_lat = np.arange(20.125, 55.0, 0.25)
+        dst_lon = np.arange(230.125, 300.0, 0.25)
         ds = xr.Dataset(
-            {"tp_6hr": (["valid_time", "latitude", "longitude"], stacked)},
+            {"tp_6hr": (["valid_time", "latitude", "longitude"],
+                        regridded.values.astype(np.float32))},
             coords={
                 "valid_time": np.array(valid_times, dtype="datetime64[ns]"),
-                "latitude": lats,
-                "longitude": lons,
+                "latitude": dst_lat,
+                "longitude": dst_lon,
             },
         )
         object.__setattr__(self, "_cached_ds", ds)
