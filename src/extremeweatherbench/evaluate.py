@@ -445,18 +445,22 @@ def compute_case_operator(
         flush=True,
     )
 
-    # Compute and cache the datasets if cache_dir is set
+    # Materialise dask arrays so metrics don't re-read from disk per metric
     t_cache_compute = time.time()
-    aligned_forecast_ds = utils.maybe_cache_and_compute(
-        aligned_forecast_ds,
-        cache_dir=cache_dir,
-        name=f"{case_operator.case_metadata.case_id_number}_{case_operator.forecast.name}",
-    )
-    aligned_target_ds = utils.maybe_cache_and_compute(
-        aligned_target_ds,
-        cache_dir=cache_dir,
-        name=f"{case_operator.case_metadata.case_id_number}_{case_operator.target.name}",
-    )
+    if cache_dir is not None:
+        aligned_forecast_ds = utils.maybe_cache_and_compute(
+            aligned_forecast_ds,
+            cache_dir=cache_dir,
+            name=f"{case_operator.case_metadata.case_id_number}_{case_operator.forecast.name}",
+        )
+        aligned_target_ds = utils.maybe_cache_and_compute(
+            aligned_target_ds,
+            cache_dir=cache_dir,
+            name=f"{case_operator.case_metadata.case_id_number}_{case_operator.target.name}",
+        )
+    else:
+        aligned_forecast_ds = aligned_forecast_ds.load()
+        aligned_target_ds = aligned_target_ds.load()
     print(
         f"[EVAL] case={case_id} forecast={forecast_name} cache/compute done in "
         f"{time.time()-t_cache_compute:.2f}s",
@@ -628,8 +632,17 @@ def _extract_standard_metadata(
     Returns:
         Dictionary of metadata for the output dataframe
     """
+    tv = target_variable
+    if isinstance(metric, metrics.ThresholdMetric) and hasattr(metric, "target_threshold"):
+        thresh = metric.target_threshold
+        tv_str = str(tv)
+        if "tp" in tv_str or "precip" in tv_str.lower():
+            tv = f"{tv_str}_{thresh * 1000:g}mm"
+        else:
+            tv = f"{tv_str}_{thresh:g}"
+
     return {
-        "target_variable": target_variable,
+        "target_variable": tv,
         "metric": metric.name,
         "target_source": case_operator.target.name,
         "forecast_source": case_operator.forecast.name,
@@ -975,6 +988,81 @@ def _build_datasets(
     return (forecast_ds, target_ds)
 
 
+def _maybe_cache_derived(
+    ds: xr.Dataset,
+    case_metadata: "cases.IndividualCase" = None,
+    source_name: str = "",
+    **kwargs,
+) -> xr.Dataset:
+    """Optionally save derived variables to NetCDF for later reuse (e.g. plotting).
+
+    Activated when ``cache_derived_dir`` is present in *kwargs*.  Each source
+    (model or target) gets its own NetCDF under::
+
+        {cache_derived_dir}/case_{id}/{source_name}/derived.nc
+
+    The dataset is returned unchanged so this can be used as a ``.pipe()`` step.
+    """
+    cache_dir = kwargs.get("cache_derived_dir")
+    if cache_dir is None or case_metadata is None:
+        return ds
+
+    # Only cache if derived variables are present (skip raw-variable datasets)
+    derived_var_names = {
+        "integrated_vapor_transport",
+        "atmospheric_river_mask",
+        "atmospheric_river_land_intersection",
+        "surface_wind_speed",
+    }
+    if not any(v in ds.data_vars for v in derived_var_names):
+        return ds
+
+    cache_path = (
+        pathlib.Path(cache_dir)
+        / f"case_{case_metadata.case_id_number}"
+        / source_name
+    )
+    cache_path.mkdir(parents=True, exist_ok=True)
+    out_file = cache_path / "derived.nc"
+
+    try:
+        import numpy as np
+
+        # Compute lazy arrays and prepare for NetCDF serialization
+        ds_out = ds.compute() if hasattr(ds, "compute") else ds.copy()
+
+        # Convert sparse arrays to dense
+        for var in list(ds_out.data_vars):
+            arr = ds_out[var].data
+            if hasattr(arr, "todense"):
+                ds_out[var] = xr.DataArray(
+                    arr.todense(), dims=ds_out[var].dims, coords=ds_out[var].coords
+                )
+
+        # Convert timedelta coords to float hours (NetCDF can't store timedelta)
+        for coord_name in list(ds_out.coords):
+            if np.issubdtype(ds_out[coord_name].dtype, np.timedelta64):
+                hours = ds_out[coord_name].values / np.timedelta64(1, "h")
+                ds_out[coord_name] = xr.Variable(
+                    ds_out[coord_name].dims,
+                    hours.astype(np.float64),
+                    attrs={"units": "hours", "long_name": f"{coord_name} (hours)"},
+                )
+
+        ds_out.to_netcdf(str(out_file), mode="w", engine="h5netcdf")
+        print(
+            f"[CACHE] Saved derived variables → {out_file} "
+            f"({len(ds_out.data_vars)} vars: {list(ds_out.data_vars)})",
+            flush=True,
+        )
+    except Exception as exc:
+        logger.warning("Failed to cache derived variables: %s", exc)
+        import traceback
+        traceback.print_exc()
+
+    return ds
+
+
 def run_pipeline(
     case_metadata: "cases.IndividualCase",
     input_data: "inputs.InputBase",
@@ -1021,6 +1109,14 @@ def run_pipeline(
                     variables=input_data.variables,
                     case_metadata=case_metadata,
                     forecast_source=input_data.name,
+                    **kwargs,
+                )
+            )
+            .pipe(
+                lambda ds: _maybe_cache_derived(
+                    ds,
+                    case_metadata=case_metadata,
+                    source_name=input_data.name,
                     **kwargs,
                 )
             )

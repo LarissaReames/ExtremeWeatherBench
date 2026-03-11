@@ -69,8 +69,17 @@ LOCAL_MODELS = [
     "WeatherMesh-4p5-Ens-Mean",
     "WeatherMesh-5c-Ens-Mean",
     "IFS-Ens-Mean",
-    "AIFS-Ens-Mean",
-#    "GFS-Ens-Mean",
+#    "AIFS",
+    "GFS-Ens-Mean",
+]
+
+# Models with upper-air data (q, u, v at pressure levels) — needed for AR events
+LOCAL_MODELS_UPPER_AIR = [
+    "WeatherMesh-4",
+    "IFS",
+    "AIFS",
+    "GFS",
+    "GFS-Ens-Mean",
 ]
 
 # NOAA S3 models (IFS-initialised AI models)
@@ -99,6 +108,7 @@ VARIABLE_MAPPING = {
     "t2":   "surface_air_temperature",
     "t2m":  "surface_air_temperature",
     "gh":   "geopotential",      # local zarr uses gh (geopotential height in m)
+    "q":    "specific_humidity",
     # WeatherNext2 names
     "mean_sea_level_pressure": "air_pressure_at_mean_sea_level",
     "10m_u_component_of_wind": "surface_eastward_wind",
@@ -153,10 +163,18 @@ def _local_needed_vars_for_event(event_type: str) -> set[str]:
     """Source variable names needed from local zarr for this event type."""
     if event_type == "tropical_cyclone":
         return {"msl", "u10", "v10"}
+    if event_type == "atmospheric_river":
+        return {"u", "v", "q"}
+    if event_type == "heavy_precip":
+        return {"tp_6hr"}
     return {"t2", "t2m"}
 
 
-def _open_single_local_zarr(zarr_path: Path, needed_vars: set[str]) -> xr.Dataset:
+def _open_single_local_zarr(
+    zarr_path: Path,
+    needed_vars: set[str],
+    bbox: tuple[float, float, float, float] | None = None,
+) -> xr.Dataset:
     """Open one local zarr init and standardise to EWB conventions.
 
     Local zarr structure:
@@ -168,10 +186,17 @@ def _open_single_local_zarr(zarr_path: Path, needed_vars: set[str]) -> xr.Datase
         dims:   lead_time (timedelta), latitude, longitude, level
         coords: init_time (scalar → will become dim after concat)
     """
-    ds = xr.open_zarr(str(zarr_path), chunks="auto")
-    # Only keep the variables we need to avoid loading the full ~19 GB file
+    ds = xr.open_zarr(str(zarr_path), chunks=None)
     keep = [v for v in needed_vars if v in ds.data_vars]
     ds = ds[keep]
+
+    if bbox is not None:
+        lat_min, lat_max, lon_min, lon_max = bbox
+        lats = ds["lat"].values
+        if lats[0] > lats[-1]:
+            ds = ds.sel(lat=slice(lat_max, lat_min), lon=slice(lon_min, lon_max))
+        else:
+            ds = ds.sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
 
     # Convert step (hours as float32) → lead_time (timedelta64)
     step_hours = ds["step"].values.astype(float)
@@ -218,6 +243,7 @@ def assemble_local_forecast(
     end_date: datetime,
     event_type: str,
     lookback_days: int = 15,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> xr.Dataset:
     """Assemble a multi-init dataset for a local model."""
     paths = _discover_local_inits(
@@ -239,7 +265,7 @@ def assemble_local_forecast(
         try:
             if i == 1 or i % 10 == 0 or i == len(paths):
                 print(f"      [{i}/{len(paths)}] {p.name}", flush=True)
-            ds = _open_single_local_zarr(p, needed_vars=needed_vars)
+            ds = _open_single_local_zarr(p, needed_vars=needed_vars, bbox=bbox)
             # Expand init_time to a dimension for concatenation
             ds = ds.expand_dims("init_time")
             datasets.append(ds)
@@ -1002,6 +1028,17 @@ def preprocess_12hourly(ds: xr.Dataset, forecast_name: str = "Unknown") -> xr.Da
     return ds
 
 
+def preprocess_6hourly(ds: xr.Dataset, forecast_name: str = "Unknown") -> xr.Dataset:
+    """Filter lead_time to 6-hourly (excluding hour 0), up to MAX_LEAD_HOURS."""
+    if "lead_time" not in ds.dims:
+        return ds
+
+    lead_hours = ds.lead_time / pd.Timedelta(hours=1)
+    mask = (lead_hours > 0) & (lead_hours % 6 == 0) & (lead_hours <= MAX_LEAD_HOURS)
+    ds = ds.sel(lead_time=ds.lead_time[mask])
+    return ds
+
+
 def preprocess_init_hours(ds: xr.Dataset, forecast_name: str = "Unknown") -> xr.Dataset:
     """Keep only common init cycles (00Z/12Z) across models."""
     if "init_time" not in ds.dims:
@@ -1093,6 +1130,17 @@ def get_variables_for_event_type(event_type: str) -> list:
             "surface_eastward_wind",
             "surface_northward_wind",
         ]
+    elif event_type == "atmospheric_river":
+        return [
+            ewb.derived.AtmosphericRiverVariables(
+                output_variables=[
+                    "atmospheric_river_land_intersection",
+                    "integrated_vapor_transport",
+                ]
+            )
+        ]
+    elif event_type == "heavy_precip":
+        return ["tp_6hr"]
     elif event_type == "heat_wave":
         return ["surface_air_temperature"]
     else:
@@ -1135,6 +1183,60 @@ def get_metrics_for_event_type(event_type: str) -> list:
                 forecast_variable=mslp, target_variable=mslp,
             ),
         ]
+    elif event_type == "atmospheric_river":
+        ar_var = "atmospheric_river_land_intersection"
+        ivt_var = "integrated_vapor_transport"
+        return [
+            # Binary AR detection metrics
+            ewb.metrics.CriticalSuccessIndex(
+                forecast_variable=ar_var, target_variable=ar_var,
+            ),
+            ewb.metrics.SpatialDisplacement(
+                forecast_variable=ar_var, target_variable=ar_var,
+            ),
+            ewb.metrics.EarlySignal(
+                forecast_variable=ar_var, target_variable=ar_var,
+            ),
+            # IVT intensity metrics
+            ewb.metrics.RootMeanSquaredError(
+                forecast_variable=ivt_var, target_variable=ivt_var,
+            ),
+            ewb.metrics.MeanAbsoluteError(
+                forecast_variable=ivt_var, target_variable=ivt_var,
+            ),
+            ewb.metrics.MeanError(
+                forecast_variable=ivt_var, target_variable=ivt_var,
+            ),
+        ]
+    elif event_type == "heavy_precip":
+        v = "tp_6hr"
+        metrics = [
+            ewb.metrics.RootMeanSquaredError(
+                preserve_dims=["lead_time", "valid_time"],
+                forecast_variable=v, target_variable=v,
+            ),
+            ewb.metrics.MeanAbsoluteError(
+                preserve_dims=["lead_time", "valid_time"],
+                forecast_variable=v, target_variable=v,
+            ),
+            ewb.metrics.MeanError(
+                preserve_dims=["lead_time", "valid_time"],
+                forecast_variable=v, target_variable=v,
+            ),
+        ]
+        for thresh_m in PRECIP_THRESHOLDS_M:
+            metrics.append(ewb.metrics.ThresholdMetric(
+                name=f"threshold_{thresh_m}",
+                preserve_dims=["lead_time", "valid_time"],
+                forecast_variable=v, target_variable=v,
+                forecast_threshold=thresh_m, target_threshold=thresh_m,
+                metrics=[
+                    ewb.metrics.FrequencyBias,
+                    ewb.metrics.EquitableThreatScore,
+                    ewb.metrics.CriticalSuccessIndex,
+                ],
+            ))
+        return metrics
     elif event_type == "heat_wave":
         t = "surface_air_temperature"
         return [
@@ -1317,7 +1419,10 @@ def _make_preprocess(
     """Create a preprocessing pipeline for a forecast."""
     def _preprocess(ds: xr.Dataset) -> xr.Dataset:
         ds = preprocess_init_hours(ds, forecast_name=name)
-        ds = preprocess_12hourly(ds, forecast_name=name)
+        if event_type == "heavy_precip":
+            ds = preprocess_6hourly(ds, forecast_name=name)
+        else:
+            ds = preprocess_12hourly(ds, forecast_name=name)
         if event_type == "tropical_cyclone":
             ds = preprocess_tc(
                 ds,
@@ -1338,6 +1443,17 @@ def _missing_required_variables(ds: xr.Dataset, required_vars: list[str]) -> lis
     return [v for v in required_vars if v not in ds.data_vars]
 
 
+def _case_bbox(case: ewb.IndividualCase, pad: float = 2.0):
+    """Extract (lat_min, lat_max, lon_min, lon_max) from a case's location, or None."""
+    loc = case.location
+    if hasattr(loc, "latitude_min"):
+        return (
+            loc.latitude_min - pad, loc.latitude_max + pad,
+            loc.longitude_min - pad, loc.longitude_max + pad,
+        )
+    return None
+
+
 def load_local_forecasts(
     case: ewb.IndividualCase,
     lookback_days: int | None = None,
@@ -1347,14 +1463,19 @@ def load_local_forecasts(
     forecasts = []
     variables = get_variables_for_event_type(case.event_type)
     required_vars = _required_base_variables(case.event_type)
+    bbox = _case_bbox(case)
 
     # Add TC derived variables if needed
     if case.event_type == "tropical_cyclone":
         variables = variables + [
             ewb.derived.TropicalCycloneTrackVariables(min_track_timesteps=5)
         ]
+        bbox = None  # TC tracks span large areas; don't pre-subset
 
-    for model_name in LOCAL_MODELS:
+    # AR events need models with upper-air data (q, u, v at pressure levels)
+    model_list = LOCAL_MODELS_UPPER_AIR if case.event_type == "atmospheric_river" else LOCAL_MODELS
+
+    for model_name in model_list:
         if only_model and model_name != only_model:
             continue
         print(f"   → {model_name} (local)")
@@ -1366,6 +1487,7 @@ def load_local_forecasts(
                 case.end_date,
                 event_type=case.event_type,
                 lookback_days=lb,
+                bbox=bbox,
             )
 
             # Apply preprocessing
@@ -1602,6 +1724,21 @@ def load_target(
     if case.event_type == "tropical_cyclone":
         print("   Using IBTrACS (observed TC tracks)")
         return ewb.inputs.IBTrACS()
+
+    if case.event_type == "heavy_precip":
+        print("   Using MRMS (radar precipitation observations)")
+        variables = get_variables_for_event_type(case.event_type)
+        return ewb.inputs.MRMS(
+            source=str(LOCAL_ZARR_ROOT),
+            start_date=case.start_date,
+            end_date=case.end_date,
+            variables=variables,
+        )
+
+    if case.event_type == "atmospheric_river":
+        print("   Using ERA5 reanalysis (AR events require gridded upper-air data)")
+        variables = get_variables_for_event_type(case.event_type)
+        return ewb.inputs.ERA5(variables=variables)
 
     if target_type == "ghcn":
         variables = get_variables_for_event_type(case.event_type)
@@ -2108,6 +2245,48 @@ def _compute_station_results(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Heavy Precipitation Evaluation (MRMS-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Precipitation thresholds for categorical metrics (in meters, matching zarr units)
+PRECIP_THRESHOLDS_MM = [
+    0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5,
+    7.5, 10, 15, 20, 25, 30, 40, 50,
+]
+PRECIP_THRESHOLDS_M = [t / 1000 for t in PRECIP_THRESHOLDS_MM]
+
+
+def _save_observed_threshold_counts(target, case, output_dir: Path):
+    """Compute and save per-threshold observed grid point counts to a JSON sidecar."""
+    import json
+    try:
+        ds = target._open_data_from_source()
+        ds = target.subset_data_to_case(ds, case)
+        da = ds["tp_6hr"]
+        vals = da.values
+        counts = {}
+        for thresh_m in PRECIP_THRESHOLDS_M:
+            label = f"tp_6hr_{thresh_m * 1000:g}mm"
+            counts[label] = int((vals > thresh_m).sum())
+        counts["total_gridpoints"] = int((~np.isnan(vals)).sum())
+        out_path = output_dir / f"case_{case.case_id_number}_obs_threshold_counts.json"
+        with open(out_path, "w") as f:
+            json.dump(counts, f, indent=2)
+        print(f"   Observed threshold counts saved to: {out_path.name}")
+    except Exception as e:
+        print(f"   ⚠️  Could not compute observed threshold counts: {e}")
+
+
+# Composite event types: when one of these events is evaluated,
+# also run the heavy_precip evaluation against MRMS.
+COMPOSITE_EVENTS = {
+    "atmospheric_river": ["heavy_precip"],
+    # Future: "tropical_cyclone": ["heavy_precip"],
+    # Future: "severe_convection": ["heavy_precip"],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2128,6 +2307,7 @@ def main(
     max_lead_hours: int = 240,
     target_type: str = "era5",
     ghcn_source: str | None = None,
+    cache_derived_dir: str | None = None,
 ):
     """Run evaluation for a 2025 case."""
     global MAX_LEAD_HOURS
@@ -2255,18 +2435,68 @@ def main(
     else:
         effective_n_jobs = n_jobs
     print(f"   Evaluation workers: n_jobs={effective_n_jobs}")
-    results = ewb_runner.run_evaluation(
+    eval_kwargs = dict(
         n_jobs=effective_n_jobs,
         debug_heat_values=debug_heat_values,
         debug_heat_max_inits=debug_heat_max_inits,
         debug_heat_max_points=debug_heat_max_points,
     )
+    if cache_derived_dir is not None:
+        eval_kwargs["cache_derived_dir"] = cache_derived_dir
+        print(f"   Caching derived variables → {cache_derived_dir}")
+    results = ewb_runner.run_evaluation(**eval_kwargs)
 
     # Save aggregate results
     results.to_csv(output_file, index=False)
     print(f"\n✅ Evaluation complete!")
     print(f"   Results saved to: {output_file}")
     print(f"   Total rows: {len(results)}")
+
+    if case.event_type == "heavy_precip":
+        _save_observed_threshold_counts(target, case, OUTPUT_DIR)
+
+    # --- Composite event sub-evaluations (e.g., heavy precip for AR events) ---
+    composite_subs = COMPOSITE_EVENTS.get(case.event_type, [])
+    if composite_subs:
+        print(f"\n🔗 Composite event: running sub-evaluations for {case.event_type}")
+        for sub_eval_type in composite_subs:
+            if sub_eval_type == "heavy_precip":
+                precip_csv = OUTPUT_DIR / f"case_{case_id}_{case.event_type}_2025_heavy_precip_results.csv"
+                try:
+                    import copy as _copy
+                    precip_case = _copy.copy(case)
+                    object.__setattr__(precip_case, "event_type", "heavy_precip")
+
+                    precip_forecasts = load_local_forecasts(
+                        precip_case, only_model=only_model,
+                    )
+                    precip_target = load_target(precip_case)
+                    precip_metrics = get_metrics_for_event_type("heavy_precip")
+                    precip_eval_objs = [
+                        ewb.inputs.EvaluationObject(
+                            event_type="heavy_precip",
+                            metric_list=precip_metrics,
+                            target=precip_target,
+                            forecast=fc,
+                        )
+                        for fc in precip_forecasts
+                    ]
+                    precip_runner = ewb.evaluate.ExtremeWeatherBench(
+                        case_metadata=[case],
+                        evaluation_objects=precip_eval_objs,
+                    )
+                    precip_results = precip_runner.run_evaluation(n_jobs=1)
+
+                    if not precip_results.empty:
+                        precip_results.to_csv(precip_csv, index=False)
+                        print(f"   Heavy precip results: {precip_csv}")
+                        results = pd.concat([results, precip_results], ignore_index=True)
+                        results.to_csv(output_file, index=False)
+                        print(f"   Updated main results: {len(results)} total rows")
+                except Exception as e:
+                    print(f"   ⚠️  Heavy precip evaluation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
 
     # --- Per-station results (only for GHCN target) ---
     if target_type == "ghcn" and len(all_forecasts) > 0:
@@ -2432,6 +2662,16 @@ if __name__ == "__main__":
             "Defaults to the built-in GCS dataset (2020-2024)."
         ),
     )
+    parser.add_argument(
+        "--cache-derived",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Cache derived variables (IVT, AR mask, etc.) to DIR as NetCDF "
+            "for later bulk plotting. Structure: DIR/case_{id}/{source}/derived.nc"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -2453,6 +2693,7 @@ if __name__ == "__main__":
             max_lead_hours=args.max_lead_hours,
             target_type=args.target_type,
             ghcn_source=args.ghcn_source,
+            cache_derived_dir=args.cache_derived,
         )
     except Exception as e:
         print(f"\n❌ EVALUATION FAILED!")

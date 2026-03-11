@@ -1,6 +1,7 @@
 import abc
 import dataclasses
 import logging
+import pathlib
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1040,6 +1041,199 @@ class IBTrACS(TargetBase):
             return data
         else:
             raise ValueError(f"Data is not a polars LazyFrame: {type(data)}")
+
+
+DEFAULT_MRMS_ZARR_ROOT = "/huge/proc/met-data/zarr"
+_MRMS_WEIGHT_DIR = pathlib.Path("~/.cache/ewb_weights").expanduser()
+
+_mrms_regridder: Optional["xesmf.Regridder"] = None
+
+
+def _get_mrms_regridder() -> "xesmf.Regridder":
+    """Return a cached xesmf conservative regridder from the MRMS 0.01° grid to 0.25°."""
+    global _mrms_regridder
+    if _mrms_regridder is not None:
+        return _mrms_regridder
+
+    import xesmf as xe
+
+    src_lat = np.arange(20.005, 55.0, 0.01)
+    src_lon = np.arange(230.005, 300.0, 0.01)
+    src_lat_b = np.arange(20.0, 55.005, 0.01)
+    src_lon_b = np.arange(230.0, 300.005, 0.01)
+
+    dst_lat = np.arange(20.125, 55.0, 0.25)
+    dst_lon = np.arange(230.125, 300.0, 0.25)
+    dst_lat_b = np.arange(20.0, 55.125, 0.25)
+    dst_lon_b = np.arange(230.0, 300.125, 0.25)
+
+    ds_in = xr.Dataset({"lat": (["y"], src_lat), "lon": (["x"], src_lon),
+                         "lat_b": (["y_b"], src_lat_b), "lon_b": (["x_b"], src_lon_b)})
+    ds_out = xr.Dataset({"lat": (["y"], dst_lat), "lon": (["x"], dst_lon),
+                          "lat_b": (["y_b"], dst_lat_b), "lon_b": (["x_b"], dst_lon_b)})
+
+    _MRMS_WEIGHT_DIR.mkdir(parents=True, exist_ok=True)
+    weight_file = str(_MRMS_WEIGHT_DIR / "mrms_to_025_conservative.nc")
+
+    _mrms_regridder = xe.Regridder(
+        ds_in, ds_out, "conservative",
+        filename=weight_file, reuse_weights=pathlib.Path(weight_file).exists(),
+    )
+    logger.info("MRMS conservative regridder ready (weights: %s)", weight_file)
+    return _mrms_regridder
+
+
+def _regrid_mrms_to_025(
+    mrms_da: xr.DataArray,
+    qi_da: xr.DataArray,
+    qi_threshold: float = 0.0,
+) -> xr.DataArray:
+    """Conservative-regrid native MRMS data onto a 0.25° grid via xesmf.
+
+    Masks pixels below *qi_threshold* using the radar quality index before
+    regridding.  NaN pixels are handled by the regridder's ``skipna`` option.
+    """
+    mrms_masked = mrms_da.where(qi_da >= qi_threshold)
+    data = mrms_masked.values
+    if data.ndim == 3:
+        data = data.squeeze()
+
+    lat = mrms_da.lat.values
+    lon = mrms_da.lon.values
+    if lat[0] > lat[-1]:
+        data = np.ascontiguousarray(data[::-1])
+        lat = lat[::-1]
+
+    da = xr.DataArray(data, dims=("y", "x"),
+                      coords={"lat": ("y", lat), "lon": ("x", lon)})
+
+    regridder = _get_mrms_regridder()
+    result = regridder(da, skipna=True, na_thres=0.5)
+
+    dst_lat = np.arange(20.125, 55.0, 0.25)
+    dst_lon = np.arange(230.125, 300.0, 0.25)
+    return xr.DataArray(
+        result.values.astype(np.float32),
+        coords={"latitude": dst_lat, "longitude": dst_lon},
+        dims=("latitude", "longitude"),
+    )
+
+
+@dataclasses.dataclass
+class MRMS(TargetBase):
+    """Target class for MRMS (Multi-Radar Multi-Sensor) precipitation data.
+
+    Loads 6-hourly MRMS precipitation from per-valid-time zarr archives,
+    quality-filters using the radar accumulation quality index, and regrids
+    to 0.25 degree resolution to match model forecast grids.
+
+    The *source* path should point to the root zarr directory containing
+    per-init subdirectories (e.g. ``/huge/proc/met-data/zarr``).  Each
+    subdirectory is expected to contain ``MRMS/MRMS_{YYYYMMDDHH}.zarr``.
+    """
+
+    name: str = "MRMS"
+    source: str = DEFAULT_MRMS_ZARR_ROOT
+    start_date: Optional[pd.Timestamp] = None
+    end_date: Optional[pd.Timestamp] = None
+    qi_threshold: float = 0.0
+    variables: Sequence[Union[str, "derived.DerivedVariable"]] = dataclasses.field(
+        default_factory=lambda: ["tp_6hr"]
+    )
+    _cached_ds: Optional[xr.Dataset] = dataclasses.field(
+        default=None, repr=False, compare=False,
+    )
+
+    def _open_data_from_source(self) -> IncomingDataInput:
+        if self._cached_ds is not None:
+            return self._cached_ds.copy(deep=False)
+        from datetime import timedelta
+
+        if self.start_date is None or self.end_date is None:
+            raise ValueError(
+                "MRMS target requires start_date and end_date to discover zarr files."
+            )
+
+        root = pathlib.Path(self.source)
+        raw_slices: list[np.ndarray] = []
+        valid_times: list[np.datetime64] = []
+        ref_lat = ref_lon = None
+        flip_lat = False
+
+        current = pd.Timestamp(self.start_date)
+        end = pd.Timestamp(self.end_date)
+        while current <= end:
+            init_str = current.strftime("%Y%m%d%H")
+            zarr_path = root / init_str / "MRMS" / f"MRMS_{init_str}.zarr"
+            if zarr_path.exists():
+                try:
+                    ds = xr.open_zarr(str(zarr_path), chunks=None)
+                    tp = ds["tp_6hr"].squeeze().values
+                    qi = ds["RadarAccumulationQualityIndex_6hr"].squeeze().values
+                    tp = np.where(qi >= self.qi_threshold, tp, np.nan)
+                    if ref_lat is None:
+                        ref_lat = ds["lat"].values
+                        ref_lon = ds["lon"].values
+                        flip_lat = ref_lat[0] > ref_lat[-1]
+                    if flip_lat:
+                        tp = tp[::-1]
+                    raw_slices.append(tp)
+                    valid_times.append(np.datetime64(current))
+                except Exception as e:
+                    logger.warning("Failed to load MRMS %s: %s", init_str, e)
+            current += timedelta(hours=6)
+
+        if not raw_slices:
+            return xr.Dataset(
+                coords={
+                    "valid_time": np.array([], dtype="datetime64[ns]"),
+                    "latitude": np.array([]),
+                    "longitude": np.array([]),
+                }
+            )
+
+        stacked_raw = np.ascontiguousarray(np.stack(raw_slices, axis=0))
+        if flip_lat:
+            ref_lat = ref_lat[::-1]
+
+        da_3d = xr.DataArray(
+            stacked_raw, dims=("time", "y", "x"),
+            coords={"lat": ("y", ref_lat), "lon": ("x", ref_lon)},
+        )
+        regridder = _get_mrms_regridder()
+        regridded = regridder(da_3d, skipna=True, na_thres=0.5)
+
+        dst_lat = np.arange(20.125, 55.0, 0.25)
+        dst_lon = np.arange(230.125, 300.0, 0.25)
+        ds = xr.Dataset(
+            {"tp_6hr": (["valid_time", "latitude", "longitude"],
+                        regridded.values.astype(np.float32))},
+            coords={
+                "valid_time": np.array(valid_times, dtype="datetime64[ns]"),
+                "latitude": dst_lat,
+                "longitude": dst_lon,
+            },
+        )
+        object.__setattr__(self, "_cached_ds", ds)
+        return ds
+
+    def subset_data_to_case(
+        self,
+        data: IncomingDataInput,
+        case_metadata: "cases.IndividualCase",
+        **kwargs,
+    ) -> IncomingDataInput:
+        drop = kwargs.get("drop", False)
+        if not isinstance(data, xr.Dataset):
+            raise ValueError(f"Expected xarray Dataset, got {type(data)}")
+        return zarr_target_subsetter(data, case_metadata, drop=drop)
+
+    def maybe_align_forecast_to_target(
+        self,
+        forecast_data: xr.Dataset,
+        target_data: xr.Dataset,
+    ) -> tuple[xr.Dataset, xr.Dataset]:
+        return align_forecast_to_target(forecast_data, target_data)
 
 
 def open_kerchunk_reference(
